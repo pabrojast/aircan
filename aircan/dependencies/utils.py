@@ -68,8 +68,8 @@ def ckan_to_frictionless_schema(field_type):
 
 def days_ago(n, hour=0, minute=0, second=0, microsecond=0):
     return datetime.combine(
-        datetime.now(timezone.TIMEZONE) - timedelta(days=n),
-        time(hour, minute, second, microsecond, tzinfo=timezone.TIMEZONE),
+        datetime.now(timezone.utc) - timedelta(days=n),
+        time(hour, minute, second, microsecond, tzinfo=timezone.utc),
     )
 
 def aircan_status_update(site_url, ckan_api_key, status_dict):
