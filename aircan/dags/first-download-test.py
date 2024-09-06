@@ -41,7 +41,7 @@ def save_stations_by_group(**context):
         stations_by_mngorg[station['mngorg']].append(station)
         
     for mngorg, stations_group in stations_by_mngorg.items():
-        filename = f"/path/to/save/{mngorg}_stations.json"
+        filename = f"{mngorg}_stations.json"
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(stations_group, f, ensure_ascii=False, indent=4)
 
@@ -60,7 +60,7 @@ def process_hourly_precipitation(**context):
             station_data = pd.DataFrame(hourly_data['list'])
             all_precipitation_data = pd.concat([all_precipitation_data, station_data], ignore_index=True)
 
-    all_precipitation_data.to_csv("/path/to/save/hourly_precipitation_data.csv", index=False)
+    all_precipitation_data.to_csv("hourly_precipitation_data.csv", index=False)
 
 # Process daily precipitation data
 def process_daily_precipitation(**context):
@@ -77,7 +77,7 @@ def process_daily_precipitation(**context):
             station_data = pd.DataFrame(daily_data['list'])
             all_precipitation_data = pd.concat([all_precipitation_data, station_data], ignore_index=True)
 
-    all_precipitation_data.to_csv("/path/to/save/daily_precipitation_data.csv", index=False)
+    all_precipitation_data.to_csv("daily_precipitation_data.csv", index=False)
 
 # Helper functions for precipitation data
 def get_hourly_precipitation(station_code, start_date, end_date):
@@ -112,23 +112,14 @@ daily_dag = DAG(
     schedule_interval='@daily',
 )
 
-# Get stations task
-get_stations_task = PythonOperator(
+# Tasks for hourly DAG
+get_stations_task_hourly = PythonOperator(
     task_id='get_stations_task',
     python_callable=get_stations,
     provide_context=True,
     dag=hourly_dag,
 )
 
-# Save stations task (only in daily DAG)
-save_stations_task = PythonOperator(
-    task_id='save_stations_by_group',
-    python_callable=save_stations_by_group,
-    provide_context=True,
-    dag=daily_dag,
-)
-
-# Hourly data task
 process_hourly_data_task = PythonOperator(
     task_id='process_hourly_precipitation',
     python_callable=process_hourly_precipitation,
@@ -136,7 +127,21 @@ process_hourly_data_task = PythonOperator(
     dag=hourly_dag,
 )
 
-# Daily data task
+# Tasks for daily DAG
+get_stations_task_daily = PythonOperator(
+    task_id='get_stations_task',
+    python_callable=get_stations,
+    provide_context=True,
+    dag=daily_dag,
+)
+
+save_stations_task = PythonOperator(
+    task_id='save_stations_by_group',
+    python_callable=save_stations_by_group,
+    provide_context=True,
+    dag=daily_dag,
+)
+
 process_daily_data_task = PythonOperator(
     task_id='process_daily_precipitation',
     python_callable=process_daily_precipitation,
@@ -144,6 +149,6 @@ process_daily_data_task = PythonOperator(
     dag=daily_dag,
 )
 
-# Set dependencies
-get_stations_task >> process_hourly_data_task
-get_stations_task >> save_stations_task >> process_daily_data_task
+# Set task dependencies for each DAG separately
+get_stations_task_hourly >> process_hourly_data_task
+get_stations_task_daily >> save_stations_task >> process_daily_data_task
