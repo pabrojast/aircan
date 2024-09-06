@@ -25,7 +25,7 @@ default_args = {
 }
 
 # Function to get stations list
-def get_stations(url):
+def get_stations(url = STATIONS_URL):
     params = {"output": "json"}
     response = requests.get(url, params=params)
     if response.status_code == 200:
@@ -119,7 +119,7 @@ def retry(func, max_attempts=3, sleep_time=5):
 
 # Function to process and save hourly precipitation data
 def process_hourly_precipitation():
-    stations = get_stations(HOURLY_PRECIPITATION_URL)
+    stations = get_stations()
     all_precipitation_data = pd.DataFrame()
     start_date, end_date = get_korean_time_range()
 
@@ -159,7 +159,7 @@ def process_hourly_precipitation():
 
 # Function to process and save daily precipitation data
 def process_daily_precipitation():
-    stations = get_stations(DAILY_PRECIPITATION_URL)
+    stations = get_stations()
     all_precipitation_data = pd.DataFrame()
     start_date, end_date = get_korean_time_range(hours_back=2160)
 
