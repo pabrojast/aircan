@@ -195,7 +195,7 @@ def process_hourly_precipitation():
     
     print("Hourly precipitation data saved.")
     print("Uploading data to IHP-WINS...")
-    upload_ckan(name = 'Hourly Precipitation 3 Last Days', description = 'This is only for testing', url = 'https://data.dev-wins.com/api/action/resource_patch',  pathtofile = "hourly_precipitation_data.csv",  resource_id = "46c3c577-c847-47b1-a833-f56b24b0aac7", package_id = "9897691a-c6d4-416c-8d16-02e0e7db1a2f")
+    upload_ckan(name = 'Hourly Precipitation Data from the Last 3 Days', description = 'This is only for testing', url = 'https://data.dev-wins.com/api/action/resource_patch',  pathtofile = "hourly_precipitation_data.csv",  resource_id = "46c3c577-c847-47b1-a833-f56b24b0aac7", package_id = "9897691a-c6d4-416c-8d16-02e0e7db1a2f")
     print("Upload done")
 
 # Function to process and save daily precipitation data
@@ -256,7 +256,7 @@ def process_daily_precipitation():
 
     print("Daily precipitation data saved.")
     print("Uploading data to IHP-WINS")
-    upload_ckan(name = 'Daily 3 Last Months', description = 'This is only for testing', url = 'https://data.dev-wins.com/api/action/resource_patch',  pathtofile = "daily_precipitation_data.csv",  resource_id = "5a157f90-7a9a-4eee-9152-d5a084598a1c", package_id = "9897691a-c6d4-416c-8d16-02e0e7db1a2f")
+    upload_ckan(name = 'Daily Precipitation Data for the Last 3 Months', description = 'This is only for testing', url = 'https://data.dev-wins.com/api/action/resource_patch',  pathtofile = "daily_precipitation_data.csv",  resource_id = "5a157f90-7a9a-4eee-9152-d5a084598a1c", package_id = "9897691a-c6d4-416c-8d16-02e0e7db1a2f")
     print("Upload done")
 
 
@@ -266,7 +266,7 @@ hourly_dag = DAG(
     'hourly_precipitation_data',
     default_args=default_args,
     description='A DAG to fetch hourly precipitation data',
-    schedule_interval=None,
+    schedule_interval="0 */3 * * *",
 )
 
 # Define the daily DAG
@@ -274,7 +274,7 @@ daily_dag = DAG(
     'daily_precipitation_data',
     default_args=default_args,
     description='A DAG to fetch daily precipitation data',
-    schedule_interval=None,
+    schedule_interval="0 3 * * *",
 )
 
 # Hourly tasks
