@@ -170,15 +170,31 @@ def process_hourly_precipitation():
 
             if hourly_data != 'ERROR' and 'list' in hourly_data:
                 station_data = pd.DataFrame(hourly_data['list'])
-                station_data['station_code'] = station_code
+                station_data['id'] = station_code
                 station_data['station_name'] = station_name
                 station_data['latitude'] = station_lat
                 station_data['longitude'] = station_lon
+                station_data['obsnmeng'] = station_info['list'][0].get('obsnmeng')
+                station_data['bbsnnm'] = station_info['list'][0].get('bbsnnm')
+                station_data['obsknd'] = station_info['list'][0].get('obsknd')
+                station_data['addr'] = station_info['list'][0].get('addr')
+                station_data['shgt'] = station_info['list'][0].get('shgt')
+                station_data['hrdtstart'] = station_info['list'][0].get('hrdtstart')
+                station_data['dydtend'] = station_info['list'][0].get('dydtend')
+                station_data['mngorg'] = station_info['list'][0].get('mngorg')
+                station_data['sbsncd'] = station_info['list'][0].get('sbsncd')
+                station_data['opendt'] = station_info['list'][0].get('opendt')
+                station_data['shgt'] = station_info['list'][0].get('shgt')
+                station_data['hrdtend'] = station_info['list'][0].get('hrdtend')
+                station_data['dydtstart'] = station_info['list'][0].get('dydtstart')
                 all_precipitation_data = pd.concat([all_precipitation_data, station_data], ignore_index=True)
 
     all_precipitation_data['time'] = all_precipitation_data['ymdh'].apply(try_parse_h)
     all_precipitation_data.to_csv("hourly_precipitation_data.csv", index=False)
     print("Hourly precipitation data saved.")
+    print("Uploading data to IHP-WINS...")
+    upload_ckan(name = 'Hourly Precipitation 3 Last Days', description = 'This is only for testing', url = 'https://data.dev-wins.com/api/action/resource_patch',  pathtofile = "hourly_precipitation_data.csv",  resource_id = "46c3c577-c847-47b1-a833-f56b24b0aac7", package_id = "9897691a-c6d4-416c-8d16-02e0e7db1a2f")
+    print("Upload done")
 
 # Function to process and save daily precipitation data
 def process_daily_precipitation():
@@ -210,10 +226,23 @@ def process_daily_precipitation():
 
             if daily_data != 'ERROR' and 'list' in daily_data:
                 station_data = pd.DataFrame(daily_data['list'])
-                station_data['station_code'] = station_code
+                station_data['id'] = station_code
                 station_data['station_name'] = station_name
                 station_data['latitude'] = station_lat
                 station_data['longitude'] = station_lon
+                station_data['obsnmeng'] = station_info['list'][0].get('obsnmeng')
+                station_data['bbsnnm'] = station_info['list'][0].get('bbsnnm')
+                station_data['obsknd'] = station_info['list'][0].get('obsknd')
+                station_data['addr'] = station_info['list'][0].get('addr')
+                station_data['shgt'] = station_info['list'][0].get('shgt')
+                station_data['hrdtstart'] = station_info['list'][0].get('hrdtstart')
+                station_data['dydtend'] = station_info['list'][0].get('dydtend')
+                station_data['mngorg'] = station_info['list'][0].get('mngorg')
+                station_data['sbsncd'] = station_info['list'][0].get('sbsncd')
+                station_data['opendt'] = station_info['list'][0].get('opendt')
+                station_data['shgt'] = station_info['list'][0].get('shgt')
+                station_data['hrdtend'] = station_info['list'][0].get('hrdtend')
+                station_data['dydtstart'] = station_info['list'][0].get('dydtstart')
                 all_precipitation_data = pd.concat([all_precipitation_data, station_data], ignore_index=True)
 
     all_precipitation_data['time'] = pd.to_datetime(all_precipitation_data['ymd'], format='%Y%m%d', errors='coerce')
