@@ -1,5 +1,7 @@
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from airflow.models import Variable
+
 import requests
 import json
 import pandas as pd
@@ -14,6 +16,7 @@ STATIONS_URL = "http://www.wamis.go.kr:8080/wamis/openapi/wkw/rf_dubrfobs"
 STATION_INFO_URL = "http://www.wamis.go.kr:8080/wamis/openapi/wkw/rf_obsinfo"
 HOURLY_PRECIPITATION_URL = "http://www.wamis.go.kr:8080/wamis/openapi/wkw/rf_hrdata"
 DAILY_PRECIPITATION_URL = "http://www.wamis.go.kr:8080/wamis/openapi/wkw/rf_dtdata"
+APIdev = Variable.get("APIDEV")
 
 # Default arguments for the DAGs
 default_args = {
@@ -117,6 +120,26 @@ def retry(func, max_attempts=3, sleep_time=5):
             attempts += 1
     raise Exception(f"Failed after {max_attempts} attempts.")
 
+#Resource Patch
+def upload_ckan(name = 'Daily 3 Last Months', description = 'This is only for testing', url = 'https://data.dev-wins.com/api/action/resource_patch',  pathtofile = "daily_precipitation_data.csv",  resource_id = "5a157f90-7a9a-4eee-9152-d5a084598a1c", package_id = "9897691a-c6d4-416c-8d16-02e0e7db1a2f"):
+    files = {'upload': open(pathtofile, 'rb')}
+    headers = {"API-Key": APIdev}
+    data_dict = {
+            'id': resource_id,
+            'package_id': package_id,
+            'format': 'CSV',
+            'name': name,
+            'description': description
+            }
+    #POST
+    response = requests.post(url, headers=headers, data=data_dict, files=files )
+
+    #LOG
+    print("Status Code", response.status_code)
+    print("JSON Response", response.json())
+
+
+
 # Function to process and save hourly precipitation data
 def process_hourly_precipitation():
     stations = get_stations()
@@ -196,6 +219,11 @@ def process_daily_precipitation():
     all_precipitation_data['time'] = pd.to_datetime(all_precipitation_data['ymd'], format='%Y%m%d', errors='coerce')
     all_precipitation_data.to_csv("daily_precipitation_data.csv", index=False)
     print("Daily precipitation data saved.")
+    print("Uploading data to IHP-WINS")
+    upload_ckan(name = 'Daily 3 Last Months', description = 'This is only for testing', url = 'https://data.dev-wins.com/api/action/resource_patch',  pathtofile = "daily_precipitation_data.csv",  resource_id = "5a157f90-7a9a-4eee-9152-d5a084598a1c", package_id = "9897691a-c6d4-416c-8d16-02e0e7db1a2f")
+    print("Upload done")
+
+
 
 # Define the hourly DAG
 hourly_dag = DAG(
