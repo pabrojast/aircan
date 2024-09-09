@@ -190,7 +190,9 @@ def process_hourly_precipitation():
                 all_precipitation_data = pd.concat([all_precipitation_data, station_data], ignore_index=True)
 
     all_precipitation_data['time'] = all_precipitation_data['ymdh'].apply(try_parse_h)
+    all_precipitation_data.loc[all_precipitation_data['rf'] == "-", 'rf'] = ""
     all_precipitation_data.to_csv("hourly_precipitation_data.csv", index=False)
+    
     print("Hourly precipitation data saved.")
     print("Uploading data to IHP-WINS...")
     upload_ckan(name = 'Hourly Precipitation 3 Last Days', description = 'This is only for testing', url = 'https://data.dev-wins.com/api/action/resource_patch',  pathtofile = "hourly_precipitation_data.csv",  resource_id = "46c3c577-c847-47b1-a833-f56b24b0aac7", package_id = "9897691a-c6d4-416c-8d16-02e0e7db1a2f")
@@ -246,7 +248,12 @@ def process_daily_precipitation():
                 all_precipitation_data = pd.concat([all_precipitation_data, station_data], ignore_index=True)
 
     all_precipitation_data['time'] = pd.to_datetime(all_precipitation_data['ymd'], format='%Y%m%d', errors='coerce')
+    # Just in Case, check column tipe
+    # all_precipitation_data['rf'] = all_precipitation_data['rf'].astype(str)
+    # Change "-" to ""
+    all_precipitation_data.loc[all_precipitation_data['rf'] == "-", 'rf'] = ""
     all_precipitation_data.to_csv("daily_precipitation_data.csv", index=False)
+
     print("Daily precipitation data saved.")
     print("Uploading data to IHP-WINS")
     upload_ckan(name = 'Daily 3 Last Months', description = 'This is only for testing', url = 'https://data.dev-wins.com/api/action/resource_patch',  pathtofile = "daily_precipitation_data.csv",  resource_id = "5a157f90-7a9a-4eee-9152-d5a084598a1c", package_id = "9897691a-c6d4-416c-8d16-02e0e7db1a2f")
