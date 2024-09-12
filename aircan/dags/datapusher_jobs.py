@@ -75,7 +75,6 @@ def datapusher_jobs_checks():
 
 datapusher_jobs_checks_task = PythonOperator(
     task_id='datapusher_jobs_check',
-    provide_context=False,
     python_callable=datapusher_jobs_checks,
     dag=dag,
 )
