@@ -764,7 +764,7 @@ hourly_dag = DAG(
     schedule_interval="0 */3 * * *",
 )
 hourly_dag_wl = DAG(
-    'kr_hourly_precipitation_data',
+    'kr_hourly_water_level_data',
     default_args=default_args,
     description='A DAG to fetch hourly wl data',
     schedule_interval="20 */3 * * *",
@@ -866,6 +866,5 @@ fetch_daily_mmp = PythonOperator(
     python_callable=process_monthly_precipitation,
     dag=daily_dag_mmp,
 )
-
 
 
