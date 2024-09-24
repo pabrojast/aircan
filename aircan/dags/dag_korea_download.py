@@ -762,18 +762,21 @@ hourly_dag = DAG(
     default_args=default_args,
     description='A DAG to fetch hourly precipitation data',
     schedule_interval="0 */3 * * *",
+    catchup=False,
 )
 hourly_dag_wl = DAG(
     'kr_hourly_water_level_data',
     default_args=default_args,
     description='A DAG to fetch hourly wl data',
     schedule_interval="20 */3 * * *",
+    catchup=False,
 )
 hourly_dag_meteo= DAG(
     'kr_hourly_meteo_data',
     default_args=default_args,
     description='A DAG to fetch hourly meteo data',
     schedule_interval="50 */3 * * *",
+    catchup=False,
 )
 # Define the daily DAG
 daily_dag = DAG(
@@ -781,6 +784,7 @@ daily_dag = DAG(
     default_args=default_args,
     description='A DAG to fetch daily precipitation data',
     schedule_interval="0 3 * * *",
+    catchup=False,
 )
 # Define the daily DAG
 daily_dag_dwl = DAG(
@@ -788,6 +792,7 @@ daily_dag_dwl = DAG(
     default_args=default_args,
     description='A DAG to fetch daily water level',
     schedule_interval="0 2 * * *",
+    catchup=False,
 )
 # Define the daily DAG
 daily_dag_dmd = DAG(
@@ -795,24 +800,28 @@ daily_dag_dmd = DAG(
     default_args=default_args,
     description='A DAG to fetch daily meteo data',
     schedule_interval="0 1 * * *",
+    catchup=False,
 )
 daily_dag_dfr = DAG(
     'kr_process_flow_rate',
     default_args=default_args,
     description='A DAG to fetch daily flow rate data',
     schedule_interval="0 5 * * *",
+    catchup=False,
 )
 daily_dag_dssl = DAG(
     'kr_process_suspended_sediment_load',
     default_args=default_args,
     description='A DAG to fetch daily sediment load',
     schedule_interval="0 6 * * *",
+    catchup=False,
 )
 daily_dag_mmp = DAG(
     'kr_process_monthly_precipitation',
     default_args=default_args,
     description='A DAG to fetch monthly precipitation',
     schedule_interval="0 7 * * *",
+    catchup=False,
 )
 
 
