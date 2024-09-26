@@ -493,7 +493,7 @@ def process_hourly_water_level():
 
     print("Hourly water level data saved.")
     print("Uploading data to IHP-WINS...")
-    upload_ckan(name=resourceIdKrWLHourlyName, description=resourceIdKrWLHourlyDescription, pathtofile="hourly_wl_data.csv", resource_id = resourceIdKrWLHourly, package_id = packageIdKr)
+    upload_ckan(name=resourceIdKrWLHourlyName, description=resourceIdKrWLHourlyDescription, pathtofile="hourly_wl_data.csv", url = urlPatch, resource_id = resourceIdKrWLHourly, package_id = packageIdKr)
     print("Upload done")
 
 # Function to process and save daily water level data
@@ -562,7 +562,7 @@ def process_daily_water_level():
 
     print("Daily water level data saved.")
     print("Uploading data to IHP-WINS...")
-    upload_ckan(name=resourceIdKrWLDailyName, description=resourceIdKrWLDailyDescription, pathtofile="daily_wl_data.csv", resource_id=resourceIdKrWLDaily, package_id=packageIdKr)
+    upload_ckan(name=resourceIdKrWLDailyName, description=resourceIdKrWLDailyDescription, pathtofile="daily_wl_data.csv", url = urlPatch, resource_id=resourceIdKrWLDaily, package_id=packageIdKr)
     print("Upload done")
 
 
@@ -638,7 +638,7 @@ def process_hourly_meteorological_data():
 
     print("Hourly meteorological data saved.")
     print("Uploading data to IHP-WINS...")
-    upload_ckan(name=resourceIdKrMetHourlyName, description=resourceIdKrMetHourlyDescription, pathtofile="hourly_meteo_data.csv", resource_id=resourceIdKrMetHourly, package_id=packageIdKr)
+    upload_ckan(name=resourceIdKrMetHourlyName, description=resourceIdKrMetHourlyDescription, pathtofile="hourly_meteo_data.csv", url = urlPatch, resource_id=resourceIdKrMetHourly, package_id=packageIdKr)
     print("Upload done")
 
 # Function to process and save daily meteorological data
@@ -721,7 +721,7 @@ def process_daily_meteorological_data():
 
     print("Daily meteorological data saved.")
     print("Uploading data to IHP-WINS...")
-    upload_ckan(name=resourceIdKrMetDailyName, description=resourceIdKrMetDailyDescription, pathtofile="daily_meteo_data.csv", resource_id=resourceIdKrMetDaily, package_id=packageIdKr)
+    upload_ckan(name=resourceIdKrMetDailyName, description=resourceIdKrMetDailyDescription, pathtofile="daily_meteo_data.csv", url = urlPatch, resource_id=resourceIdKrMetDaily, package_id=packageIdKr)
     print("Upload done")
     
 # Function to get daily flow rate data
@@ -766,7 +766,7 @@ def process_flow_rate():
     all_flow_data.to_csv("daily_flow_rate_data.csv", index=False)
     print("Daily flow rate data saved.")
     print("Uploading data to IHP-WINS...")
-    upload_ckan(name=resourceIdKrFRDailyName, description=resourceIdKrFRDailyDescription, pathtofile="daily_flow_rate_data.csv", resource_id=resourceIdKrFRDaily , package_id=packageIdKr)
+    upload_ckan(name=resourceIdKrFRDailyName, description=resourceIdKrFRDailyDescription, url = urlPatch, pathtofile="daily_flow_rate_data.csv", resource_id=resourceIdKrFRDaily , package_id=packageIdKr)
     print("Upload done")
 
 def process_suspended_sediment_load():
@@ -793,7 +793,7 @@ def process_suspended_sediment_load():
     all_ssl_data.to_csv("suspended_sediment_load_data.csv", index=False)
     print("Suspended sediment load data saved.")
     print("Uploading data to IHP-WINS...")
-    upload_ckan(name=resourceIdKrSSLName, description=resourceIdKrSSLDescription, pathtofile="suspended_sediment_load_data.csv", resource_id=resourceIdKrSSL, package_id=packageIdKr)
+    upload_ckan(name=resourceIdKrSSLName, description=resourceIdKrSSLDescription, url = urlPatch, pathtofile="suspended_sediment_load_data.csv", resource_id=resourceIdKrSSL, package_id=packageIdKr)
     print("Upload done")
     
 
