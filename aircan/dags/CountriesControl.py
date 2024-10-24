@@ -3,15 +3,16 @@ import json
 import requests
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from airflow.models import Variable
 from datetime import datetime, timedelta
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
 
 # Configuration
-SENDGRID_API_KEY = os.environ.get('SENDGRID_API_KEY')
-SENDER_EMAIL = os.environ.get('SENDER_EMAIL')
-RECIPIENT_EMAIL = os.environ.get('RECIPIENT_EMAIL')
-UNESCO_API_TOKEN = os.environ.get('UNESCO_API_TOKEN')
+SENDGRID_API_KEY = Variable.get('SENDGRID_API_KEY')
+SENDER_EMAIL = Variable.get('SENDER_EMAIL')
+RECIPIENT_EMAIL = Variable.get('RECIPIENT_EMAIL')
+UNESCO_API_TOKEN = Variable.get('UNESCO_API_TOKEN')
 
 API_URL = "https://data.dev-wins.com/api/action/group_show?id=member-states&include_groups=True"
 UNESCO_API_URL = "https://www.unesco.org/strapi/api/countries"
