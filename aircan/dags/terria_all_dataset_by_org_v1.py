@@ -5,6 +5,10 @@ import xml.etree.ElementTree as ET
 import urllib.parse
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.models import Variable
+from datetime import datetime, timedelta
 
 # ------------------------------
 # Configurations
@@ -26,6 +30,12 @@ adapter = HTTPAdapter(max_retries=retry_strategy)
 http = requests.Session()
 http.mount("https://", adapter)
 http.mount("http://", adapter)
+
+# CKAN API Configuration
+ckan_api_url = f"{site_url}api/3/action/resource_patch"
+APIdev = Variable.get("APIDEV")
+resource_id = "3ecda851-fe1f-4329-b07b-1b196d413339"
+package_id = "47ed8576-0ff6-4934-a75a-effb81dc2e72"
 
 # ------------------------------
 # Functions
@@ -280,75 +290,123 @@ def convert_sets_to_lists(obj):
         return [convert_sets_to_lists(v) for v in obj]
     return obj
 
-# ------------------------------
-# Main Script
-# ------------------------------
+def upload_ckan(name='catalog_grouped.json', description='Generated catalog', url=ckan_api_url, pathtofile="catalog_grouped.json", resource_id=resource_id, package_id=package_id):
+    """
+    Uploads a file to CKAN, replacing the specified resource.
+    """
+    files = {'upload': open(pathtofile, 'rb')}
+    headers = {"Authorization": APIdev}
+    data_dict = {
+        'id': resource_id,
+        'package_id': package_id,
+        'format': 'JSON',
+        'name': name,
+        'description': description
+    }
+    # POST request
+    response = requests.post(url, headers=headers, data=data_dict, files=files)
+    
+    # Logging
+    print("Status Code", response.status_code)
+    print("JSON Response", response.json())
 
-# 1. Obtain package IDs from the organization
-package_list_url = f"{base_url}package_list"
-package_list_data = get_api_data(package_list_url)
+def generate_and_upload_catalog():
+    # 1. Obtain package IDs from the organization
+    package_list_url = f"{base_url}package_list"
+    package_list_data = get_api_data(package_list_url)
 
-if package_list_data and 'result' in package_list_data:
-    package_ids = package_list_data['result']
-else:
-    print("Failed to obtain package IDs.")
-    exit()
+    if package_list_data and 'result' in package_list_data:
+        package_ids = package_list_data['result']
+    else:
+        print("Failed to obtain package IDs.")
+        return  # exit the function
 
-# Create data structures for grouping
-datasets_by_org = defaultdict(lambda: defaultdict(list))
+    # Create data structures for grouping
+    datasets_by_org = defaultdict(lambda: defaultdict(list))
 
-# Main loop to process resources
-for package_id in package_ids:
-    package_url = f"{base_url}package_show?id={package_id}"
-    package_data = get_api_data(package_url)
+    # Main loop to process resources
+    for package_id in package_ids:
+        package_url = f"{base_url}package_show?id={package_id}"
+        package_data = get_api_data(package_url)
 
-    if not package_data or 'result' not in package_data:
-        continue
+        if not package_data or 'result' not in package_data:
+            continue
 
-    org = package_data['result'].get('organization')
-    if not org:
-        continue
-    org_name = org.get('title', 'No Organization')
-    dataset_title = package_data['result']['title']
-    notes = package_data['result'].get('notes', '')
-    resources = package_data['result'].get('resources', [])
+        org = package_data['result'].get('organization')
+        if not org:
+            continue
+        org_name = org.get('title', 'No Organization')
+        dataset_title = package_data['result']['title']
+        notes = package_data['result'].get('notes', '')
+        resources = package_data['result'].get('resources', [])
 
-    # Filter and process resources
-    for resource in resources:
-        resource_format = resource.get('format', '').lower()
-        if resource_format in [f.lower() for f in formatos_permitidos]:
-            formatted_item = format_dataset_item(resource, package_id, notes)
-            datasets_by_org[org_name][dataset_title].append(formatted_item)
+        # Filter and process resources
+        for resource in resources:
+            resource_format = resource.get('format', '').lower()
+            if resource_format in [f.lower() for f in formatos_permitidos]:
+                formatted_item = format_dataset_item(resource, package_id, notes)
+                datasets_by_org[org_name][dataset_title].append(formatted_item)
 
-# Create the final catalog structure
-catalog = {
-    "catalog": []
-}
-
-# Build the hierarchy
-for org_name, datasets in datasets_by_org.items():
-    org_group = {
-        "name": org_name,
-        "type": "group",
-        "members": []
+    # Create the final catalog structure
+    catalog = {
+        "catalog": []
     }
 
-    for dataset_title, items in datasets.items():
-        dataset_group = {
-            "name": dataset_title,
+    # Build the hierarchy
+    for org_name, datasets in datasets_by_org.items():
+        org_group = {
+            "name": org_name,
             "type": "group",
-            "members": items
+            "members": []
         }
-        org_group["members"].append(dataset_group)
 
-    catalog["catalog"].append(org_group)
+        for dataset_title, items in datasets.items():
+            dataset_group = {
+                "name": dataset_title,
+                "type": "group",
+                "members": items
+            }
+            org_group["members"].append(dataset_group)
 
-# Ensure sets are converted to lists before serialization
-catalog = convert_sets_to_lists(catalog)
+        catalog["catalog"].append(org_group)
 
-# Write the final configuration file
-output_file = "catalog_grouped.json"
-with open(output_file, 'w', encoding='utf-8') as f:
-    json.dump(catalog, f, ensure_ascii=False, indent=2)
+    # Ensure sets are converted to lists before serialization
+    catalog = convert_sets_to_lists(catalog)
 
-print(f"Catalog with styles saved to: {output_file}")
+    # Write the final configuration file
+    output_file = "catalog_grouped.json"
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump(catalog, f, ensure_ascii=False, indent=2)
+
+    print(f"Catalog with styles saved to: {output_file}")
+
+    # Upload the generated catalog to CKAN
+    print("Uploading catalog to CKAN...")
+    upload_ckan()
+    print("Upload done.")
+
+# ------------------------------
+# Airflow DAG Configuration
+# ------------------------------
+
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'start_date': datetime(2024, 9, 13),
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5),
+}
+
+dag = DAG(
+    'update_catalog_grouped_json',
+    default_args=default_args,
+    description='Generate and upload catalog_grouped.json every hour',
+    schedule_interval='0 * * * *',  # every hour at minute 0
+    catchup=False,
+)
+
+generate_and_upload_task = PythonOperator(
+    task_id='generate_and_upload_catalog',
+    python_callable=generate_and_upload_catalog,
+    dag=dag,
+)
