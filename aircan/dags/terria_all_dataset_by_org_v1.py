@@ -15,8 +15,8 @@ from datetime import datetime, timedelta
 # ------------------------------
 
 # Base URLs and site configurations
-site_url = "https://data.dev-wins.com/"
-base_url = "https://data.dev-wins.com/api/3/action/"
+site_url = "https://ihp-wins.unesco.org/"
+base_url = "https://ihp-wins.unesco.org/api/3/action/"
 formatos_permitidos = ['KML', 'tif', 'tiff', 'geotiff', 'csv', 'wms', 'wmts', 'shape', 'shp']
 
 # Retry configuration
@@ -34,8 +34,8 @@ http.mount("http://", adapter)
 # CKAN API Configuration
 ckan_api_url = f"{site_url}api/3/action/resource_patch"
 APIdev = Variable.get("APIDEV")
-resource_id = "3ecda851-fe1f-4329-b07b-1b196d413339"
-package_id = "47ed8576-0ff6-4934-a75a-effb81dc2e72"
+resource_id = "d38e6e75-dcc3-4e41-924e-edf41997be15"
+package_id = "8aadbf95-c6ed-4366-9ad7-deafd033ae15"
 
 # ------------------------------
 # Functions
@@ -392,7 +392,7 @@ def generate_and_upload_catalog():
 default_args = {
     'owner': 'airflow',
     'depends_on_past': False,
-    'start_date': datetime(2024, 9, 13),
+    'start_date': datetime(2024, 10, 29),
     'retries': 1,
     'retry_delay': timedelta(minutes=5),
 }
