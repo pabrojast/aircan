@@ -290,7 +290,7 @@ def convert_sets_to_lists(obj):
         return [convert_sets_to_lists(v) for v in obj]
     return obj
 
-def upload_ckan(name='catalog_grouped.json', description='Generated catalog', url=ckan_api_url, pathtofile="catalog_grouped.json", resource_id=resource_id, package_id=package_id):
+def upload_ckan(name='IHP-WINS.json', description='Generated catalog', url=ckan_api_url, pathtofile="IHP-WINS.json", resource_id=resource_id, package_id=package_id):
     """
     Uploads a file to CKAN, replacing the specified resource.
     """
@@ -374,7 +374,7 @@ def generate_and_upload_catalog():
     catalog = convert_sets_to_lists(catalog)
 
     # Write the final configuration file
-    output_file = "catalog_grouped.json"
+    output_file = "IHP-WINS"
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(catalog, f, ensure_ascii=False, indent=2)
 
@@ -400,7 +400,7 @@ default_args = {
 dag = DAG(
     'update_catalog_grouped_json',
     default_args=default_args,
-    description='Generate and upload catalog_grouped.json every hour',
+    description='Generate and upload IHP-WINS.json every hour',
     schedule_interval='0 * * * *',  # every hour at minute 0
     catchup=False,
 )
