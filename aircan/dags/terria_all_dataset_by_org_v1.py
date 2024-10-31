@@ -374,7 +374,7 @@ def generate_and_upload_catalog():
     catalog = convert_sets_to_lists(catalog)
 
     # Write the final configuration file
-    output_file = "IHP-WINS"
+    output_file = "IHP-WINS.json"
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(catalog, f, ensure_ascii=False, indent=2)
 
