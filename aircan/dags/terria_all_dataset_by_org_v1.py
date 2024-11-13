@@ -445,7 +445,7 @@ def upload_ckan(file_path, entity_name=None, entity_type='organization'):
     
     # Get the ID of the package
     package_show_url = f"{ckan_api_url}package_show"
-    params = {"id": "terriajs-catalog-files"}
+    params = {"id": "terriajs-map-catalog-in-json-format"}
     
     try:
         response = requests.get(package_show_url, params=params, headers=headers)
