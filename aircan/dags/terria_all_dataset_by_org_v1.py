@@ -664,6 +664,10 @@ def generate_and_upload_catalog_by_tag():
 
     # Main loop to process tags
     for tag_name in tag_names:
+        # Omit the tag 'IHP-WINS' to prevent conflict with IHP-WINS.json
+        if tag_name == 'IHP-WINS':
+            continue
+
         tag_show_url = f"{base_url}tag_show?id={urllib.parse.quote_plus(tag_name)}&include_datasets=True"
         tag_data = get_api_data(tag_show_url)
         if not tag_data or 'result' not in tag_data:
