@@ -744,7 +744,7 @@ def generate_and_upload_catalog_by_tag():
 
     # Save and upload consolidated catalog
     #write_catalog_file(convert_sets_to_lists(catalog), "IHP-WINS_tags.json")
-    #print("Consolidated catalog by tags saved to: IHP-WINS_tags.json")
+    print("Consolidated catalog by tags saved to: Skipped")
     #upload_ckan("IHP-WINS_tags.json")
 
 # ------------------------------
