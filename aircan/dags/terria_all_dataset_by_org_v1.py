@@ -15,8 +15,8 @@ from datetime import datetime, timedelta
 # ------------------------------
 
 # Base URLs and site configurations
-site_url = "https://data.dev-wins.com/"
-base_url = "https://data.dev-wins.com/api/3/action/"
+site_url = "https://ihp-wins.unesco.org/"
+base_url = "https://ihp-wins.unesco.org/api/3/action/"
 formatos_permitidos = ['KML', 'tif', 'tiff', 'geotiff', 'csv', 'wms', 'wmts', 'shape', 'shp']
 
 # Retry configuration
