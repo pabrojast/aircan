@@ -567,12 +567,22 @@ def generate_and_upload_catalog():
 
     # Build the hierarchy and create individual organization files
     for org_name, datasets in datasets_by_org.items():
+        org_info = org_info_cache[org_name]
         # Create structure for the individual organization file
         org_catalog = {
             "catalog": [{
                 "name": org_name,
                 "type": "group",
-                "members": []
+                "members": [],
+                "info": [
+                    {
+                        "name": f"Organization: {org_info['display_name']}",
+                        "content": f"<img style=\"max-width:300px;width:100%\" alt=\"{org_info['display_name']}\" src=\"{org_info['image_display_url']}\" /><br/>{org_info['description']}<br/>"
+                    }
+                ],
+                "infoSectionOrder": [
+                    f"Organization: {org_info['display_name']}"
+                ]
             }]
         }
         
@@ -580,14 +590,32 @@ def generate_and_upload_catalog():
         org_group = {
             "name": org_name,
             "type": "group",
-            "members": []
+            "members": [],
+            "info": [
+                {
+                    "name": f"Organization: {org_info['display_name']}",
+                    "content": f"<img style=\"max-width:300px;width:100%\" alt=\"{org_info['display_name']}\" src=\"{org_info['image_display_url']}\" /><br/>{org_info['description']}<br/>"
+                }
+            ],
+            "infoSectionOrder": [
+                f"Organization: {org_info['display_name']}"
+            ]
         }
 
         for dataset_title, items in datasets.items():
             dataset_group = {
                 "name": dataset_title,
                 "type": "group",
-                "members": items
+                "members": items,
+                "info": [
+                    {
+                        "name": f"About Dataset",
+                        "content": notes or ''
+                    }
+                ],
+                "infoSectionOrder": [
+                    "About Dataset"
+                ]
             }
             org_group["members"].append(dataset_group)
             org_catalog["catalog"][0]["members"].append(dataset_group)
@@ -601,7 +629,7 @@ def generate_and_upload_catalog():
         upload_ckan(org_filename, entity_name=org_name, entity_type='organization')
 
     # Save and upload consolidated file
-    write_catalog_file(convert_sets_to_lists(catalog), "IHP-WINS.json")
+    write_catalog_file(convert_sets_to_lists({"catalog": catalog["catalog"]}), "IHP-WINS.json")
     print("Consolidated catalog saved to: IHP-WINS.json")
     upload_ckan("IHP-WINS.json")
 
