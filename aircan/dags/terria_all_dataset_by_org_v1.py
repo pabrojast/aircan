@@ -32,7 +32,7 @@ http.mount("https://", adapter)
 http.mount("http://", adapter)
 
 # CKAN API Configuration
-ckan_api_url = "https://data.dev-wins.com/api/3/action/"
+ckan_api_url = "https://ihp-wins.unesco.org/api/3/action/"
 APIdev = Variable.get("APIDEV")
 
 # ------------------------------
