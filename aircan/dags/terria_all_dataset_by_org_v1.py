@@ -15,8 +15,8 @@ from datetime import datetime, timedelta
 # ------------------------------
 
 # Base URLs and site configurations
-site_url = "https://data.dev-wins.com/"
-base_url = "https://data.dev-wins.com/api/3/action/"
+site_url = "https://ihp-wins.unesco.org/"
+base_url = "https://ihp-wins.unesco.org/api/3/action/"
 formatos_permitidos = ['KML', 'tif', 'tiff', 'geotiff', 'csv', 'wms', 'wmts', 'shape', 'shp']
 
 # Retry configuration
@@ -401,6 +401,22 @@ def write_catalog_file(catalog_data, filename, entity_name=None, entity_type=Non
                 }
             ]
         }
+    elif filename.startswith('tag_'):
+        # For tag files, include catalog, workbench, models, but without 'version' and 'initSources'
+        final_data = {
+            "catalog": catalog_data['catalog'],
+            "workbench": workbench_items,
+            "models": {
+                **container_ids,
+                "/": {"type": "group"}
+            },
+            "viewerMode": "3dSmooth",
+            "focusWorkbenchItems": True,
+            "baseMaps": {
+                "defaultBaseMapId": "basemap-positron",
+                "previewBaseMapId": "basemap-positron"
+            }
+        }
     elif entity_type == 'organization':
         # For organization files, include 'previewedItemId'
         final_data = {
@@ -408,7 +424,7 @@ def write_catalog_file(catalog_data, filename, entity_name=None, entity_type=Non
             "previewedItemId": f"//{entity_name}"
         }
     else:
-        # For tag files or others
+        # For other files, only include 'catalog'
         final_data = {
             "catalog": catalog_data['catalog']
         }
