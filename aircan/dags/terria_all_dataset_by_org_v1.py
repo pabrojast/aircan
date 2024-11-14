@@ -446,7 +446,7 @@ def upload_ckan(file_path, entity_name=None, entity_type='organization'):
     
     # Get the ID of the package
     package_show_url = f"{ckan_api_url}package_show"
-    params = {"id": "terriajs-catalog-files"}
+    params = {"id": "terriajs-map-catalog-in-json-format"}
     
     try:
         response = requests.get(package_show_url, params=params, headers=headers)
@@ -665,6 +665,9 @@ def generate_and_upload_catalog_by_tag():
 
     # Main loop to process tags
     for tag_name in tag_names:
+        # Omit the tag 'IHP-WINS' to prevent conflict with IHP-WINS.json
+        if tag_name == 'IHP-WINS':
+            continue
         tag_show_url = f"{base_url}tag_show?id={urllib.parse.quote_plus(tag_name)}&include_datasets=True"
         tag_data = get_api_data(tag_show_url)
         if not tag_data or 'result' not in tag_data:
@@ -741,8 +744,8 @@ def generate_and_upload_catalog_by_tag():
 
     # Save and upload consolidated catalog
     write_catalog_file(convert_sets_to_lists(catalog), "IHP-WINS_tags.json")
-    print("Consolidated catalog by tags saved to: IHP-WINS_tags.json")
-    upload_ckan("IHP-WINS_tags.json")
+    print("Consolidated catalog by tags saved to: Skipped")
+    #upload_ckan("IHP-WINS_tags.json")
 
 # ------------------------------
 # Airflow DAG Configuration
