@@ -357,8 +357,8 @@ def write_catalog_file(catalog_data, filename, entity_name=None, entity_type=Non
     container_ids = {}
     
     # Collect all items for the workbench
-    def collect_items(members, parent_path="/"):
-        for item in members:
+    def collect_items(catalog_items, parent_path="/"):
+        for item in catalog_items:
             if item['type'] == 'group':
                 current_path = f"{parent_path}//{item['name']}"
                 container_ids[current_path] = {
@@ -366,7 +366,8 @@ def write_catalog_file(catalog_data, filename, entity_name=None, entity_type=Non
                     "knownContainerUniqueIds": [parent_path],
                     "type": "group"
                 }
-                collect_items(item['members'], current_path)
+                if 'members' in item:
+                    collect_items(item['members'], current_path)
             else:
                 workbench_items.append(item['id'])
                 container_ids[item['id']] = {
@@ -377,7 +378,7 @@ def write_catalog_file(catalog_data, filename, entity_name=None, entity_type=Non
                 }
 
     # Process catalog members
-    collect_items(catalog_data['catalog'][0]['members'])
+    collect_items(catalog_data['catalog'])
     
     # Determine what to include in the output based on filename
     if filename == 'IHP-WINS.json':
@@ -445,7 +446,7 @@ def upload_ckan(file_path, entity_name=None, entity_type='organization'):
     
     # Get the ID of the package
     package_show_url = f"{ckan_api_url}package_show"
-    params = {"id": "terriajs-map-catalog-in-json-format"}
+    params = {"id": "terriajs-catalog-files"}
     
     try:
         response = requests.get(package_show_url, params=params, headers=headers)
@@ -645,7 +646,7 @@ def generate_and_upload_catalog():
         upload_ckan(org_filename, entity_name=org_name, entity_type='organization')
 
     # Save and upload consolidated file
-    write_catalog_file(convert_sets_to_lists({"catalog": catalog["catalog"]}), "IHP-WINS.json")
+    write_catalog_file(convert_sets_to_lists(catalog), "IHP-WINS.json")
     print("Consolidated catalog saved to: IHP-WINS.json")
     upload_ckan("IHP-WINS.json")
 
@@ -664,10 +665,6 @@ def generate_and_upload_catalog_by_tag():
 
     # Main loop to process tags
     for tag_name in tag_names:
-        # Omit the tag 'IHP-WINS' to prevent conflict with IHP-WINS.json
-        if tag_name == 'IHP-WINS':
-            continue
-
         tag_show_url = f"{base_url}tag_show?id={urllib.parse.quote_plus(tag_name)}&include_datasets=True"
         tag_data = get_api_data(tag_show_url)
         if not tag_data or 'result' not in tag_data:
@@ -743,9 +740,9 @@ def generate_and_upload_catalog_by_tag():
         upload_ckan(tag_filename, entity_name=tag_name, entity_type='tag')
 
     # Save and upload consolidated catalog
-    #write_catalog_file(convert_sets_to_lists(catalog), "IHP-WINS_tags.json")
-    print("Consolidated catalog by tags saved to: Skipped")
-    #upload_ckan("IHP-WINS_tags.json")
+    write_catalog_file(convert_sets_to_lists(catalog), "IHP-WINS_tags.json")
+    print("Consolidated catalog by tags saved to: IHP-WINS_tags.json")
+    upload_ckan("IHP-WINS_tags.json")
 
 # ------------------------------
 # Airflow DAG Configuration
@@ -754,7 +751,7 @@ def generate_and_upload_catalog_by_tag():
 default_args = {
     'owner': 'airflow',
     'depends_on_past': False,
-    'start_date': datetime(2024, 10, 29),
+    'start_date': datetime(2024, 11, 13),
     'retries': 1,
     'retry_delay': timedelta(minutes=5),
 }
