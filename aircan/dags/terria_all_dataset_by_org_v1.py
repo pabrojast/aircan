@@ -1,6 +1,7 @@
 import requests
 import json
-from collections import defaultdict, Counter
+import copy
+from collections import defaultdict
 import xml.etree.ElementTree as ET
 import urllib.parse
 from requests.adapters import HTTPAdapter
@@ -33,7 +34,7 @@ http.mount("http://", adapter)
 
 # CKAN API Configuration
 ckan_api_url = "https://ihp-wins.unesco.org/api/3/action/"
-APIdev = Variable.get("APIDEV")
+APIdev = Variable.get("APIDEV")  # Ensure this variable is set in Airflow Variables
 
 # ------------------------------
 # Functions
@@ -349,50 +350,30 @@ def convert_sets_to_lists(obj):
         return [convert_sets_to_lists(v) for v in obj]
     return obj
 
+def remove_info_section_order(catalog_items):
+    """
+    Recursively removes 'infoSectionOrder' from catalog items.
+    """
+    for item in catalog_items:
+        item.pop('infoSectionOrder', None)
+        if 'members' in item:
+            remove_info_section_order(item['members'])
+
 def write_catalog_file(catalog_data, filename, entity_name=None, entity_type=None):
     """
-    Writes a catalog to a JSON file with additional configuration for the workbench.
+    Writes a catalog to a JSON file with appropriate configurations.
     """
-    workbench_items = []
-    container_ids = {}
-    
-    # Collect all items for the workbench
-    def collect_items(catalog_items, parent_path="/"):
-        for item in catalog_items:
-            if item['type'] == 'group':
-                current_path = f"{parent_path}//{item['name']}"
-                container_ids[current_path] = {
-                    "isOpen": True,
-                    "knownContainerUniqueIds": [parent_path],
-                    "type": "group"
-                }
-                if 'members' in item:
-                    collect_items(item['members'], current_path)
-            else:
-                workbench_items.append(item['id'])
-                container_ids[item['id']] = {
-                    "show": True,
-                    "isOpenInWorkbench": True,
-                    "knownContainerUniqueIds": [parent_path],
-                    "type": item['type']
-                }
-
-    # Process catalog members
-    collect_items(catalog_data['catalog'])
-    
     # Determine what to include in the output based on filename
     if filename == 'IHP-WINS.json':
-        # Full structure for the main file
+        # Remove 'infoSectionOrder' from catalog_data
+        catalog_data_no_info_order = copy.deepcopy(catalog_data)
+        remove_info_section_order(catalog_data_no_info_order['catalog'])
+        # For main IHP-WINS.json file, include 'version' and 'initSources' without 'workbench' and 'models'
         final_data = {
             "version": "8.0.0",
             "initSources": [
                 {
-                    "catalog": catalog_data['catalog'],
-                    "workbench": workbench_items,
-                    "models": {
-                        **container_ids,
-                        "/": {"type": "group"}
-                    },
+                    "catalog": catalog_data_no_info_order['catalog'],
                     "viewerMode": "3dSmooth",
                     "focusWorkbenchItems": True,
                     "baseMaps": {
@@ -403,7 +384,33 @@ def write_catalog_file(catalog_data, filename, entity_name=None, entity_type=Non
             ]
         }
     elif filename.startswith('tag_'):
-        # For tag files, include catalog, workbench, models, but without 'version' and 'initSources'
+        # For tag files, include 'workbench' and 'models'
+        workbench_items = []
+        container_ids = {}
+
+        # Collect all items for the workbench
+        def collect_items(catalog_items, parent_path="/"):
+            for item in catalog_items:
+                if item['type'] == 'group':
+                    current_path = f"{parent_path}//{item['name']}"
+                    container_ids[current_path] = {
+                        "isOpen": True,
+                        "knownContainerUniqueIds": [parent_path],
+                        "type": "group"
+                    }
+                    if 'members' in item:
+                        collect_items(item['members'], current_path)
+                else:
+                    workbench_items.append(item['id'])
+                    container_ids[item['id']] = {
+                        "show": True,
+                        "isOpenInWorkbench": True,
+                        "knownContainerUniqueIds": [parent_path],
+                        "type": item['type']
+                    }
+        # Process catalog members
+        collect_items(catalog_data['catalog'])
+
         final_data = {
             "catalog": catalog_data['catalog'],
             "workbench": workbench_items,
@@ -443,18 +450,18 @@ def upload_ckan(file_path, entity_name=None, entity_type='organization'):
         entity_type (str): Type of the entity ('organization' or 'tag')
     """
     headers = {"Authorization": APIdev}
-    
+
     # Get the ID of the package
     package_show_url = f"{ckan_api_url}package_show"
     params = {"id": "terriajs-map-catalog-in-json-format"}
-    
+
     try:
         response = requests.get(package_show_url, params=params, headers=headers)
         if response.status_code == 200:
             package_data = response.json()
             package_id = package_data['result']['id']
             resources = package_data['result'].get('resources', [])
-            
+
             # Determine the final name and description based on entity type
             if entity_name:
                 if entity_type == 'organization':
@@ -484,10 +491,10 @@ def upload_ckan(file_path, entity_name=None, entity_type='organization'):
                     "This JSON file contains the consolidated visualization settings "
                     "and data layers from all contributing organizations and tags."
                 )
-            
+
             # Look for an existing resource with the same name
             existing_resource = next((r for r in resources if r['name'] == final_name), None)
-            
+
             files = {'upload': open(file_path, 'rb')}
             data_dict = {
                 'package_id': package_id,
@@ -495,7 +502,7 @@ def upload_ckan(file_path, entity_name=None, entity_type='organization'):
                 'name': final_name,
                 'description': description
             }
-            
+
             if existing_resource:
                 # Update the existing resource
                 data_dict['id'] = existing_resource['id']
@@ -505,10 +512,10 @@ def upload_ckan(file_path, entity_name=None, entity_type='organization'):
                 # Create a new resource
                 create_url = f"{ckan_api_url}resource_create"
                 response = requests.post(create_url, headers=headers, data=data_dict, files=files)
-            
+
             print(f"Status Code: {response.status_code}")
             print(f"Response: {response.json()}")
-            
+
         else:
             print(f"Failed to retrieve package: {response.status_code}")
     except Exception as e:
@@ -569,7 +576,7 @@ def generate_and_upload_catalog():
             if resource_format in [f.lower() for f in formatos_permitidos]:
                 formatted_item, total_views = format_dataset_item(resource, package_id, notes, org_info)
                 datasets_by_org[org_name][dataset_title].append(formatted_item)
-                
+
                 if total_views > 1:
                     view_index = 1
                     while view_index < total_views:
@@ -602,7 +609,7 @@ def generate_and_upload_catalog():
                 ]
             }]
         }
-        
+
         # Create structure for the main catalog
         org_group = {
             "name": org_name,
@@ -638,7 +645,7 @@ def generate_and_upload_catalog():
             org_catalog["catalog"][0]["members"].append(dataset_group)
 
         catalog["catalog"].append(org_group)
-        
+
         # Save and upload individual organization file
         org_filename = f"catalog_{org_name.lower().replace(' ', '_')}.json"
         write_catalog_file(convert_sets_to_lists(org_catalog), org_filename, entity_name=org_name, entity_type='organization')
@@ -665,7 +672,6 @@ def generate_and_upload_catalog_by_tag():
 
     # Main loop to process tags
     for tag_name in tag_names:
-        # Omit the tag 'IHP-WINS' to prevent conflict with IHP-WINS.json
         if tag_name == 'IHP-WINS':
             continue
         tag_show_url = f"{base_url}tag_show?id={urllib.parse.quote_plus(tag_name)}&include_datasets=True"
@@ -692,7 +698,7 @@ def generate_and_upload_catalog_by_tag():
                 if resource_format in [f.lower() for f in formatos_permitidos]:
                     formatted_item, total_views = format_dataset_item(resource, package_id, notes, org_info)
                     datasets_by_tag[tag_name][dataset_title].append(formatted_item)
-                    
+
                     # Handle multiple views
                     if total_views > 1:
                         view_index = 1
@@ -743,7 +749,7 @@ def generate_and_upload_catalog_by_tag():
         upload_ckan(tag_filename, entity_name=tag_name, entity_type='tag')
 
     # Save and upload consolidated catalog
-    write_catalog_file(convert_sets_to_lists(catalog), "IHP-WINS_tags.json")
+    #write_catalog_file(convert_sets_to_lists(catalog), "IHP-WINS_tags.json")
     print("Consolidated catalog by tags saved to: Skipped")
     #upload_ckan("IHP-WINS_tags.json")
 
@@ -754,7 +760,7 @@ def generate_and_upload_catalog_by_tag():
 default_args = {
     'owner': 'airflow',
     'depends_on_past': False,
-    'start_date': datetime(2024, 11, 13),
+    'start_date': datetime(2024, 10, 29),
     'retries': 1,
     'retry_delay': timedelta(minutes=5),
 }
