@@ -1,7 +1,6 @@
 import requests
 import json
-import copy
-from collections import defaultdict
+from collections import defaultdict, Counter
 import xml.etree.ElementTree as ET
 import urllib.parse
 from requests.adapters import HTTPAdapter
@@ -34,7 +33,7 @@ http.mount("http://", adapter)
 
 # CKAN API Configuration
 ckan_api_url = "https://ihp-wins.unesco.org/api/3/action/"
-APIdev = Variable.get("APIDEV")  # Ensure this variable is set in Airflow Variables
+APIdev = Variable.get("APIDEV")
 
 # ------------------------------
 # Functions
@@ -350,47 +349,24 @@ def convert_sets_to_lists(obj):
         return [convert_sets_to_lists(v) for v in obj]
     return obj
 
-def remove_info_section_order(catalog_items):
-    """
-    Recursively removes 'infoSectionOrder' from catalog items.
-    """
-    for item in catalog_items:
-        item.pop('infoSectionOrder', None)
-        if 'members' in item:
-            remove_info_section_order(item['members'])
-
 def write_catalog_file(catalog_data, filename, entity_name=None, entity_type=None):
     """
-    Writes a catalog to a JSON file with appropriate configurations.
+    Writes a catalog to a JSON file with additional configuration.
     """
     # Determine what to include in the output based on filename
     if filename == 'IHP-WINS.json':
-        # Remove 'infoSectionOrder' from catalog_data
-        catalog_data_no_info_order = copy.deepcopy(catalog_data)
-        remove_info_section_order(catalog_data_no_info_order['catalog'])
-        # For main IHP-WINS.json file, include 'version' and 'initSources' without 'workbench' and 'models'
+        # For 'IHP-WINS.json', only include 'catalog'
         final_data = {
-            "version": "8.0.0",
-            "initSources": [
-                {
-                    "catalog": catalog_data_no_info_order['catalog'],
-                    "viewerMode": "3dSmooth",
-                    "focusWorkbenchItems": True,
-                    "baseMaps": {
-                        "defaultBaseMapId": "basemap-positron",
-                        "previewBaseMapId": "basemap-positron"
-                    }
-                }
-            ]
+            "catalog": catalog_data['catalog']
         }
-    elif filename.startswith('tag_'):
-        # For tag files, include 'workbench' and 'models'
+    else:
+        # Collect workbench items and models when necessary
         workbench_items = []
         container_ids = {}
 
         # Collect all items for the workbench
-        def collect_items(catalog_items, parent_path="/"):
-            for item in catalog_items:
+        def collect_items(members, parent_path="/"):
+            for item in members:
                 if item['type'] == 'group':
                     current_path = f"{parent_path}//{item['name']}"
                     container_ids[current_path] = {
@@ -398,8 +374,7 @@ def write_catalog_file(catalog_data, filename, entity_name=None, entity_type=Non
                         "knownContainerUniqueIds": [parent_path],
                         "type": "group"
                     }
-                    if 'members' in item:
-                        collect_items(item['members'], current_path)
+                    collect_items(item['members'], current_path)
                 else:
                     workbench_items.append(item['id'])
                     container_ids[item['id']] = {
@@ -408,34 +383,38 @@ def write_catalog_file(catalog_data, filename, entity_name=None, entity_type=Non
                         "knownContainerUniqueIds": [parent_path],
                         "type": item['type']
                     }
-        # Process catalog members
-        collect_items(catalog_data['catalog'])
 
-        final_data = {
-            "catalog": catalog_data['catalog'],
-            "workbench": workbench_items,
-            "models": {
-                **container_ids,
-                "/": {"type": "group"}
-            },
-            "viewerMode": "3dSmooth",
-            "focusWorkbenchItems": True,
-            "baseMaps": {
-                "defaultBaseMapId": "basemap-positron",
-                "previewBaseMapId": "basemap-positron"
+        # Process catalog members
+        collect_items(catalog_data['catalog'][0]['members'])
+
+        # Now determine what to include
+        if filename.startswith('tag_'):
+            # For tag files, include catalog, workbench, models, but without 'version' and 'initSources'
+            final_data = {
+                "catalog": catalog_data['catalog'],
+                "workbench": workbench_items,
+                "models": {
+                    **container_ids,
+                    "/": {"type": "group"}
+                },
+                "viewerMode": "3dSmooth",
+                "focusWorkbenchItems": True,
+                "baseMaps": {
+                    "defaultBaseMapId": "basemap-positron",
+                    "previewBaseMapId": "basemap-positron"
+                }
             }
-        }
-    elif entity_type == 'organization':
-        # For organization files, include 'previewedItemId'
-        final_data = {
-            "catalog": catalog_data['catalog'],
-            "previewedItemId": f"//{entity_name}"
-        }
-    else:
-        # For other files, only include 'catalog'
-        final_data = {
-            "catalog": catalog_data['catalog']
-        }
+        elif entity_type == 'organization':
+            # For organization files, include 'previewedItemId'
+            final_data = {
+                "catalog": catalog_data['catalog'],
+                "previewedItemId": f"//{entity_name}"
+            }
+        else:
+            # For other files, include only 'catalog'
+            final_data = {
+                "catalog": catalog_data['catalog']
+            }
 
     with open(filename, 'w', encoding='utf-8') as f:
         json.dump(final_data, f, ensure_ascii=False, indent=2)
@@ -653,7 +632,7 @@ def generate_and_upload_catalog():
         upload_ckan(org_filename, entity_name=org_name, entity_type='organization')
 
     # Save and upload consolidated file
-    write_catalog_file(convert_sets_to_lists(catalog), "IHP-WINS.json")
+    write_catalog_file(convert_sets_to_lists({"catalog": catalog["catalog"]}), "IHP-WINS.json")
     print("Consolidated catalog saved to: IHP-WINS.json")
     upload_ckan("IHP-WINS.json")
 
@@ -672,8 +651,10 @@ def generate_and_upload_catalog_by_tag():
 
     # Main loop to process tags
     for tag_name in tag_names:
+        # Omit the tag 'IHP-WINS' to prevent conflict with IHP-WINS.json
         if tag_name == 'IHP-WINS':
             continue
+
         tag_show_url = f"{base_url}tag_show?id={urllib.parse.quote_plus(tag_name)}&include_datasets=True"
         tag_data = get_api_data(tag_show_url)
         if not tag_data or 'result' not in tag_data:
@@ -748,10 +729,7 @@ def generate_and_upload_catalog_by_tag():
         print(f"Catalog for tag {tag_name} saved to: {tag_filename}")
         upload_ckan(tag_filename, entity_name=tag_name, entity_type='tag')
 
-    # Save and upload consolidated catalog
-    #write_catalog_file(convert_sets_to_lists(catalog), "IHP-WINS_tags.json")
     print("Consolidated catalog by tags saved to: Skipped")
-    #upload_ckan("IHP-WINS_tags.json")
 
 # ------------------------------
 # Airflow DAG Configuration
