@@ -166,8 +166,6 @@ def process_daily_precipitation():
     upload_ckan(name='Testing Daily Precipitation', description='Test Data', url='https://data.dev-wins.com/api/action/resource_patch', pathtofile="daily_precipitation_data.csv", resource_id="7bc71960-6a9f-4189-94f1-6db211a912d6", package_id="702b0105-d9f7-4747-ba42-8fa2f36ae086")
     print("Upload done")
     
-#process_daily_precipitation()
-
 
 APIdev = Variable.get("APIDEV")
 
@@ -200,7 +198,7 @@ default_args = {
 
 # Define the hourly DAG
 hourly_dag = DAG(
-    'Example Test Precipitation',
+    'example__test_precipitation_dag',
     default_args=default_args,
     description='A DAG to fetch hourly precipitation data as Example',
     schedule_interval="0 */3 * * *",
@@ -208,7 +206,7 @@ hourly_dag = DAG(
 )
 
 fetch_daily_data = PythonOperator(
-    task_id='Example Test Precipitation',
+    task_id='example__test_precipitation',
     python_callable=process_daily_precipitation,
     dag=hourly_dag,
 )
