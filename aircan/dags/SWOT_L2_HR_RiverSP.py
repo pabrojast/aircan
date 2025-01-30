@@ -11,6 +11,21 @@ from time import sleep
 ###config
 APIdev = Variable.get("APIDEV")
 
+def setup_netrc():
+    # Obtenemos las credenciales de Airflow Variables (o de os.environ)
+    username = Variable.get("NASA_USERNAME")
+    password = Variable.get("NASA_PASSWORD")
+    
+    netrc_path = os.path.expanduser("~/.netrc")  # /home/airflow/.netrc en contenedores de Airflow
+    with open(netrc_path, "w") as f:
+        f.write(f"""machine urs.earthdata.nasa.gov
+    login {username}
+    password {password}
+""")
+    # Ajustar permisos a 600 (lectura/escritura sólo para el dueño)
+    os.chmod(netrc_path, 0o600)
+    print(f".netrc creado en {netrc_path}")
+
 default_args = {
     'owner': 'airflow',
     'depends_on_past': False,
@@ -61,6 +76,8 @@ def check_file_exists_in_api(name):
         return False, None
 
 def download_swot_data():    
+    #creamos (o reescribimos) el archivo .netrc para que podaac-data-subscriber tenga credenciales
+    setup_netrc()
     # Primero verificar si el comando existe
     try:
         subprocess.run(['podaac-data-subscriber', '--version'], 
