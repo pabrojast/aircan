@@ -50,24 +50,30 @@ def retry(func, max_attempts=3, sleep_time=5):
 
 def check_file_exists_in_api(name):
     api_url = "https://data.dev-wins.com/api/3/action/package_show"
-    params = {
-        "id": "surface-water-and-ocean-topography-of-the-dnipro-river-in-ukraine"
-    }
+    
+    # Define los IDs de ambos datasets
+    package_ids = [
+        "swot-level-2-river-single-pass-vector-node-data-product-for-ukraine",
+        "swot-level-2-river-single-pass-vector-reach-data-product-for-ukraine"
+    ]
     
     try:
-        response = requests.get(api_url, params=params)
-        response.raise_for_status()
-        data = response.json()
-        
-        if data["success"]:
-            resources = data["result"]["resources"]
-            name_lower = name.lower()  # Convert input filename to lowercase
-            for resource in resources:
-                resource_url = resource["url"].lower()  # Convert URL to lowercase
-                if resource_url.endswith(name_lower):
-                    print("Skipping file", name)
-                    last_modified = datetime.strptime(resource["last_modified"], "%Y-%m-%dT%H:%M:%S.%f")
-                    return True, last_modified
+        # Verificar en ambos datasets
+        for package_id in package_ids:
+            params = {"id": package_id}
+            response = requests.get(api_url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            if data["success"]:
+                resources = data["result"]["resources"]
+                name_lower = name.lower()  # Convert input filename to lowercase
+                for resource in resources:
+                    resource_url = resource["url"].lower()  # Convert URL to lowercase
+                    if resource_url.endswith(name_lower):
+                        print(f"Archivo {name} encontrado en dataset {package_id}")
+                        last_modified = datetime.strptime(resource["last_modified"], "%Y-%m-%dT%H:%M:%S.%f")
+                        return True, last_modified
         
         return False, None
         
@@ -122,27 +128,47 @@ def download_swot_data():
         print(f"Error: {e.stderr}")
         return False
 
-def upload_ckan(package_id="surface-water-and-ocean-topography-of-the-dnipro-river-in-ukraine",
-                url='https://data.dev-wins.com/api/3/action/resource_create'):
+def get_file_type(filename):
+    """Determine if the file is a Node or Reach type"""
+    if '_Node_' in filename:
+        return 'node'
+    elif '_Reach_' in filename:
+        return 'reach'
+    return None
+
+def upload_ckan(
+    node_package_id="swot-level-2-river-single-pass-vector-node-data-product-for-ukraine",
+    reach_package_id="swot-level-2-river-single-pass-vector-reach-data-product-for-ukraine",
+    url='https://data.dev-wins.com/api/3/action/resource_create'
+):
     """
-    Upload all SWOT data files from the data directory to CKAN platform
+    Upload SWOT data files from the data directory to CKAN platform,
+    separating Node and Reach files into different datasets
     """
     data_dir = "./data"
     
-    # Verificar si el directorio existe
     if not os.path.exists(data_dir):
         print(f"El directorio {data_dir} no existe")
         return
     
-    # Procesar cada archivo en el directorio
     for filename in os.listdir(data_dir):
         file_path = os.path.join(data_dir, filename)
+        
+        # Determine file type
+        file_type = get_file_type(filename)
+        if not file_type:
+            print(f"Archivo {filename} no reconocido como Node o Reach, saltando...")
+            continue
+            
+        # Select appropriate package_id based on file type
+        package_id = node_package_id if file_type == 'node' else reach_package_id
+        
         exists, last_modified = check_file_exists_in_api(filename)
         if exists:
             print(f"El archivo ya existe en la API (última modificación: {last_modified})")
             print("Cancelando la subida...")
             continue
-        # Solo procesar archivos, no directorios
+
         if os.path.isfile(file_path):
             try:
                 files = {'upload': open(file_path, 'rb')}
@@ -151,7 +177,7 @@ def upload_ckan(package_id="surface-water-and-ocean-topography-of-the-dnipro-riv
                 data_dict = {
                     'package_id': package_id,
                     'name': filename,
-                    'description': f'SWOT data file: {filename}',
+                    'description': f'SWOT {file_type.upper()} data file: {filename}',
                     'format': 'shp'  
                 }
                 
@@ -159,7 +185,7 @@ def upload_ckan(package_id="surface-water-and-ocean-topography-of-the-dnipro-riv
                 response = requests.post(url, headers=headers, data=data_dict, files=files)
                 
                 # Logging
-                print(f"Subiendo archivo: {filename}")
+                print(f"Subiendo archivo {file_type}: {filename}")
                 print("Status Code:", response.status_code)
                 print("JSON Response:", response.json())
                 
