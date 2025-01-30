@@ -131,7 +131,7 @@ hourly_dag = DAG(
     'Nasa_hourly_data',
     default_args=default_args,
     description='A DAG to fetch hourly nasa SWOT_L2_HR_RiverSP_2.0',
-    schedule_interval="0 */3 * * *",
+    schedule_interval="0 */10 * * *",
     catchup=False,
 )
 # Hourly tasks
