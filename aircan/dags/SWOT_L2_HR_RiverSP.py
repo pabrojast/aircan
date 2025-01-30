@@ -61,24 +61,48 @@ def check_file_exists_in_api(name):
         return False, None
 
 def download_swot_data():    
+    # Primero verificar si el comando existe
+    try:
+        subprocess.run(['podaac-data-subscriber', '--version'], 
+                      check=True, 
+                      capture_output=True, 
+                      text=True)
+    except subprocess.CalledProcessError:
+        print("Error: podaac-data-subscriber no está instalado o no es accesible")
+        sys.exit(1)
+    except FileNotFoundError:
+        print("Error: podaac-data-subscriber no se encuentra en el PATH")
+        sys.exit(1)
+
+    end_date = datetime.now().strftime('%Y-%m-%dT%H:%M:%SZ')
+    
     command = [
         'podaac-data-subscriber',
         '-c', 'SWOT_L2_HR_RiverSP_2.0',
         '-d', './data',
         '--start-date', '2024-12-01T00:00:00Z',
-        '--end-date', '2025-31-01T00:00:00Z',
+        '--end-date', end_date,
         '-e', '.zip',
         '-b', '22,44,40,52'
     ]
     
     try:
-        result = subprocess.run(command, check=True, capture_output=True, text=True)
-        print("Descarga exitosa!")
+        # Ejecutar con shell=True si es necesario en tu entorno
+        result = subprocess.run(command, 
+                              check=True, 
+                              capture_output=True, 
+                              text=True,
+                              shell=False)  # Cambiar a True si es necesario
+        print("Comando ejecutado:")
+        print(" ".join(command))
+        print("\nSalida:")
         print(result.stdout)
+        return True
     except subprocess.CalledProcessError as e:
         print("Error durante la descarga:")
-        print(e.stderr)
-        sys.exit(1)
+        print(f"Código de salida: {e.returncode}")
+        print(f"Error: {e.stderr}")
+        return False
 
 def upload_ckan(package_id="surface-water-and-ocean-topography-of-the-dnipro-river-in-ukraine",
                 url='https://data.dev-wins.com/api/3/action/resource_create'):
