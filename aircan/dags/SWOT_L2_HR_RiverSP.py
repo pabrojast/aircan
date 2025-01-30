@@ -23,7 +23,7 @@ def setup_netrc():
     password {password}
 """)
     # Ajustar permisos a 600 (lectura/escritura sólo para el dueño)
-    os.chmod(netrc_path, 0o600)
+    os.chmod(netrc_path, 600)
     print(f".netrc creado en {netrc_path}")
 
 default_args = {
