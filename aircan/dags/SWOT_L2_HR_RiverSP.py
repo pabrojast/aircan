@@ -114,6 +114,7 @@ def download_swot_data():
         print(" ".join(command))
         print("\nSalida:")
         print(result.stdout)
+        upload_ckan()
         return True
     except subprocess.CalledProcessError as e:
         print("Error durante la descarga:")
@@ -181,11 +182,3 @@ fetch_hourly_meteo = PythonOperator(
     python_callable=download_swot_data,
     dag=hourly_dag,
 )
-# Añadir la tarea de upload al DAG
-upload_swot = PythonOperator(
-    task_id='upload_swot_data',
-    python_callable=upload_ckan,
-    dag=hourly_dag,
-)
-# Definir el orden de las tareas
-fetch_hourly_meteo >> upload_swot
