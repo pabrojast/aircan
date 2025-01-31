@@ -103,12 +103,13 @@ def download_swot_data():
         'podaac-data-subscriber',
         '-c', 'SWOT_L2_HR_RiverSP_2.0',
         '-d', './data',
-        '--start-date', '2024-12-01T00:00:00Z',
-        '--end-date', end_date,
+        '-m', '1200',
         '-e', '.zip',
         '-b', '22,44,40,52'
     ]
-    
+    #'--start-date', '2024-12-01T00:00:00Z'
+    #'--end-date', end_date
+
     try:
         # Ejecutar con shell=True si es necesario en tu entorno
         result = subprocess.run(command, 
@@ -121,6 +122,7 @@ def download_swot_data():
         print("\nSalida:")
         print(result.stdout)
         upload_ckan()
+        main()
         return True
     except subprocess.CalledProcessError as e:
         print("Error durante la descarga:")
