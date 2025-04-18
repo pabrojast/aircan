@@ -19,9 +19,12 @@ site_url = "https://ihp-wins.unesco.org/"
 base_url = "https://ihp-wins.unesco.org/api/3/action/"
 formatos_permitidos = ['KML', 'tif', 'tiff', 'geotiff', 'csv', 'wms', 'wmts', 'shape', 'shp']
 
+# Timeout configuration (add timeouts to prevent tasks from hanging)
+TIMEOUT_SECONDS = 120
+
 # Retry configuration
 retry_strategy = Retry(
-    total=5,
+    total=2,
     backoff_factor=1,
     status_forcelist=[429, 500, 502, 503, 504],
     allowed_methods=["GET", "POST"]
@@ -41,15 +44,18 @@ APIdev = Variable.get("APIDEV")
 
 def get_api_data(url):
     """
-    Performs a GET request to the given URL with retry logic.
+    Performs a GET request to the given URL with retry logic and timeout.
     """
     try:
-        response = http.get(url)
+        response = http.get(url, timeout=TIMEOUT_SECONDS)
         if response.status_code == 200:
             return response.json()
         else:
             print(f"Error in request to {url}: {response.status_code}")
             return None
+    except requests.exceptions.Timeout:
+        print(f"Request to {url} timed out after {TIMEOUT_SECONDS} seconds")
+        return None
     except Exception as e:
         print(f"Exception during request to {url}: {e}")
         return None
@@ -59,7 +65,7 @@ def process_sld_styles(style_url, resource_format):
     Retrieves and processes the SLD styles from the given URL.
     """
     try:
-        response = http.get(style_url)
+        response = http.get(style_url, timeout=TIMEOUT_SECONDS)
         if response.status_code == 200:
             sld_xml = response.text
             root = ET.fromstring(sld_xml)
@@ -156,6 +162,9 @@ def process_sld_styles(style_url, resource_format):
         else:
             print(f"Error fetching SLD styles from {style_url}: {response.status_code}")
             return None
+    except requests.exceptions.Timeout:
+        print(f"Request to {style_url} timed out after {TIMEOUT_SECONDS} seconds")
+        return None
     except Exception as e:
         print(f"Error processing SLD: {e}")
         return None
@@ -435,7 +444,7 @@ def upload_ckan(file_path, entity_name=None, entity_type='organization'):
     params = {"id": "terriajs-map-catalog-in-json-format"}
 
     try:
-        response = requests.get(package_show_url, params=params, headers=headers)
+        response = requests.get(package_show_url, params=params, headers=headers, timeout=TIMEOUT_SECONDS)
         if response.status_code == 200:
             package_data = response.json()
             package_id = package_data['result']['id']
@@ -486,17 +495,19 @@ def upload_ckan(file_path, entity_name=None, entity_type='organization'):
                 # Update the existing resource
                 data_dict['id'] = existing_resource['id']
                 update_url = f"{ckan_api_url}resource_update"
-                response = requests.post(update_url, headers=headers, data=data_dict, files=files)
+                response = requests.post(update_url, headers=headers, data=data_dict, files=files, timeout=TIMEOUT_SECONDS)
             else:
                 # Create a new resource
                 create_url = f"{ckan_api_url}resource_create"
-                response = requests.post(create_url, headers=headers, data=data_dict, files=files)
+                response = requests.post(create_url, headers=headers, data=data_dict, files=files, timeout=TIMEOUT_SECONDS)
 
             print(f"Status Code: {response.status_code}")
             print(f"Response: {response.json()}")
 
         else:
             print(f"Failed to retrieve package: {response.status_code}")
+    except requests.exceptions.Timeout:
+        print(f"Upload to CKAN timed out after {TIMEOUT_SECONDS} seconds")
     except Exception as e:
         print(f"Error in upload_ckan: {e}")
 
@@ -741,6 +752,10 @@ default_args = {
     'start_date': datetime(2024, 10, 29),
     'retries': 1,
     'retry_delay': timedelta(minutes=5),
+    'execution_timeout': timedelta(minutes=30),  # Add timeout to each task
+    'dagrun_timeout': timedelta(minutes=60),     # Add timeout to the entire DAG
+    'max_active_runs': 1,  # Allow only 1 active run at a time
+    'concurrency': 2       # Maximum number of task instances to run concurrently
 }
 
 dag = DAG(
