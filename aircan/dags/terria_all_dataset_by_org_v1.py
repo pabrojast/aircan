@@ -364,9 +364,10 @@ def write_catalog_file(catalog_data, filename, entity_name=None, entity_type=Non
     """
     # Determine what to include in the output based on filename
     if filename == 'IHP-WINS.json':
-        # For 'IHP-WINS.json', only include 'catalog'
+        # For 'IHP-WINS.json', only include 'catalog' and add name
         final_data = {
-            "catalog": catalog_data['catalog']
+            "catalog": catalog_data['catalog'],
+            "name": "IHP-WINS"
         }
     else:
         # Collect workbench items and models when necessary
