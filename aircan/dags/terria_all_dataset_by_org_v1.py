@@ -289,8 +289,7 @@ def format_dataset_item(resource, package_id, notes, org_info, view_index=0):
                 elemento['styles'] = [{
                     "id": property_name,
                     "color": {
-                        "enumColors": style_config['enum_colors'],
-                        "colorPalette": "HighContrast"
+                        "enumColors": style_config['enum_colors']
                     }
                 }]
                 elemento['activeStyle'] = property_name
