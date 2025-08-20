@@ -80,25 +80,30 @@ def process_sld_styles(style_url, resource_format):
                 # Process raster styles for COG files
                 colors = []
                 legend_items = []
-                color_map_entries = root.findall('.//sld:ColorMapEntry', namespaces)
-                for entry in color_map_entries:
-                    quantity = entry.get('quantity')
-                    color = entry.get('color')
-                    label = entry.get('label', '')
+                try:
+                    color_map_entries = root.findall('.//sld:ColorMapEntry', namespaces)
+                    for entry in color_map_entries:
+                        quantity = entry.get('quantity')
+                        color = entry.get('color')
+                        label = entry.get('label', '')
 
-                    # Convert color to RGB string
-                    if color.startswith('#'):
-                        hex_color = color.lstrip('#')
-                        rgb = tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
-                        rgb_string = f"rgb({rgb[0]}, {rgb[1]}, {rgb[2]})"
-                    else:
-                        rgb_string = color
+                        # Convert color to RGB string
+                        if color.startswith('#'):
+                            hex_color = color.lstrip('#')
+                            rgb = tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+                            rgb_string = f"rgb({rgb[0]}, {rgb[1]}, {rgb[2]})"
+                        else:
+                            rgb_string = color
 
-                    colors.append([float(quantity), rgb_string])
-                    legend_items.append({
-                        "title": label.replace('+', ' '),
-                        "color": color
-                    })
+                        colors.append([float(quantity), rgb_string])
+                        legend_items.append({
+                            "title": label,
+                            "color": color
+                        })
+                except Exception as e:
+                    print(f"Error parsing SLD XML: {e}")
+                    colors = []
+                    legend_items = []
 
                 return {
                     'colors': colors,
@@ -115,45 +120,43 @@ def process_sld_styles(style_url, resource_format):
 
                 valid_property_name = None  # To store a valid property name
 
-                rules = root.findall('.//se:Rule', namespaces)
-                for rule in rules:
-                    name = rule.find('se:Name', namespaces)
-                    title = rule.find('.//se:Title', namespaces)
-                    fill = rule.find('.//se:Fill/se:SvgParameter[@name="fill"]', namespaces)
-                    property_name_element = rule.find('.//ogc:PropertyName', namespaces)
-                    property_value_element = rule.find('.//ogc:Literal', namespaces)
+                try:
+                    rules = root.findall('.//se:Rule', namespaces)
+                    for rule in rules:
+                        name = rule.find('se:Name', namespaces)
+                        title = rule.find('.//se:Title', namespaces)
+                        fill = rule.find('.//se:Fill/se:SvgParameter[@name="fill"]', namespaces)
+                        property_name_element = rule.find('.//ogc:PropertyName', namespaces)
+                        property_value_element = rule.find('.//ogc:Literal', namespaces)
 
-                    if fill is not None and (name is not None or title is not None):
-                        color = fill.text
-                        label = (title.text if title is not None else name.text) if name is not None else "No label"
-                        label = label.replace('+', ' ')
+                        if fill is not None and (name is not None or title is not None):
+                            color = fill.text
+                            label = (title.text if title is not None else name.text) if name is not None else "Sin etiqueta"
 
-                        # Add to legend
-                        styles['legend_items'].append({
-                            "title": label,
-                            "color": color
-                        })
-
-                        # Only process if property_name has a non-empty value
-                        if (property_name_element is not None and property_name_element.text and
-                            property_name_element.text.strip() and property_value_element is not None):
-
-                            property_value = property_value_element.text
-                            property_name = property_name_element.text.strip()
-                            valid_property_name = property_name  # Store property name for later use
-
-                            # Convert color to RGBA string
-                            if color.startswith('#'):
-                                hex_color = color.lstrip('#')
-                                rgb = tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
-                                rgba_string = f"rgba({rgb[0]}, {rgb[1]}, {rgb[2]},1)"
-                            else:
-                                rgba_string = color
-
-                            styles['enum_colors'].append({
-                                "value": property_value.replace('+', ' '),
-                                "color": rgba_string
+                            # Add to legend
+                            styles['legend_items'].append({
+                                "title": label,
+                                "color": color
                             })
+
+                            # Only process if property_name has a non-empty value
+                            if (property_name_element is not None and property_name_element.text and
+                                property_name_element.text.strip() and property_value_element is not None):
+
+                                property_value = property_value_element.text
+                                property_name = property_name_element.text.strip()
+                                valid_property_name = property_name  # Store property name for later use
+
+                                # Convert color to RGBA string (como en el plugin)
+                                styles['enum_colors'].append({
+                                    "value": property_value,
+                                    "color": f"rgba({int(color[1:3],16)},{int(color[3:5],16)},{int(color[5:7],16)},1)"
+                                })
+                except Exception as e:
+                    print(f"Error parsing SLD XML: {e}")
+                    styles['legend_items'] = []
+                    styles['enum_colors'] = []
+                    
                 # Update property_name with valid_property_name
                 styles['property_name'] = valid_property_name
                 return styles
@@ -185,7 +188,11 @@ def format_dataset_item(resource, package_id, notes, org_info, view_index=0):
     """
     resource_id = resource['id']
     resource_format = resource['format'].lower()
-    resource_name = resource['name']
+    # Fix para recursos sin nombre - generar nombre por defecto (del plugin)
+    resource_name = resource.get('name', '').strip()
+    if not resource_name or resource_name.lower() in ['', 'none', 'null', 'undefined', 'unnamed resource']:
+        # Usar el ID del recurso o un nombre genérico
+        resource_name = resource.get('id', f"Resource_{hash(resource.get('url', 'sin_url')) % 10000}")
     resource_url = resource['url']
     resource_description = resource.get('description', '')
 
@@ -289,11 +296,15 @@ def format_dataset_item(resource, package_id, notes, org_info, view_index=0):
                 elemento['styles'] = [{
                     "id": property_name,
                     "color": {
-                        "enumColors": style_config['enum_colors']
+                        "enumColors": style_config['enum_colors'],
+                        "colorPalette": "HighContrast"  # Agregar colorPalette para mejor visualización
                     }
                 }]
                 elemento['activeStyle'] = property_name
                 elemento['opacity'] = 0.8
+                # Agregar propiedades adicionales para mejor renderizado
+                elemento['clampToGround'] = False
+                elemento['forceCesiumPrimitives'] = True
                 # Corrected legends structure
                 elemento['legends'] = [
                     {
