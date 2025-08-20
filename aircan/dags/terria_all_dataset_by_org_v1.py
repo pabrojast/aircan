@@ -273,7 +273,7 @@ def format_dataset_item(resource, package_id, notes, org_info, view_index=0):
 
     # Apply styles from SLD if available
     if style_config:
-        if resource_format in ['cog']:
+        if resource_format in ['cog', 'tif', 'tiff', 'geotiff']:
             # For raster data (COG files)
             elemento['renderOptions'] = {
                 "single": {
@@ -321,35 +321,84 @@ def format_dataset_item(resource, package_id, notes, org_info, view_index=0):
                             "items": style_config['legend_items']
                         }
                     ]
-    # If there are no styles from SLD but there is custom_config, process custom_config
-    elif custom_config and custom_config not in ['NA', '']:
+    
+    # Process custom_config if available (can be combined with SLD styles)
+    if custom_config and custom_config not in ['NA', '']:
         try:
-            # Extract the 'start' parameter from the URL
+            # Extract the 'start' or 'share' parameter from the URL
             parsed_url = urllib.parse.urlparse(custom_config)
             fragment = parsed_url.fragment
-            start_param = fragment.split('=', 1)[1]
-            decoded_param = urllib.parse.unquote_plus(start_param)
-
+            
+            if fragment.startswith('share='):
+                # Case of URL with #share (gist)
+                gist_id = fragment.split('=g-')[1]
+                gist_url = f'https://gist.githubusercontent.com/pabrojast/{gist_id}/raw/Terriajs-usercatalog.json'
+                try:
+                    response = http.get(gist_url, timeout=TIMEOUT_SECONDS)
+                    if response.status_code == 200:
+                        decoded_param = response.text
+                    else:
+                        decoded_param = '{}'
+                except Exception as e:
+                    print(f"Error fetching gist config: {e}")
+                    decoded_param = '{}'
+            else:
+                # Original case with #start
+                start_param = fragment.split('=', 1)[1]
+                decoded_param = urllib.parse.unquote(start_param)
+            
             # Parse the JSON
             custom_data = json.loads(decoded_param)
+            
+            # Helper function to decode names (like in the plugin)
+            def decode_names(obj):
+                if isinstance(obj, dict):
+                    new_dict = {}
+                    for key, value in obj.items():
+                        # Decode the key if it contains '+'
+                        new_key = urllib.parse.unquote_plus(key) if '+' in key else key
+                        
+                        if isinstance(value, dict):
+                            # If there are specific fields that contain names
+                            if 'name' in value:
+                                value['name'] = urllib.parse.unquote_plus(value['name'])
+                            if 'title' in value:
+                                value['title'] = urllib.parse.unquote_plus(value['title'])
+                            if 'legend' in value and isinstance(value['legend'], dict):
+                                if 'title' in value['legend']:
+                                    value['legend']['title'] = urllib.parse.unquote_plus(value['legend']['title'])
+                            
+                            value = decode_names(value)
+                        elif isinstance(value, list):
+                            value = [urllib.parse.unquote_plus(item) if isinstance(item, str) else decode_names(item) for item in value]
+                        elif isinstance(value, str) and '+' in value:
+                            value = urllib.parse.unquote_plus(value)
+                            
+                        new_dict[new_key] = value
+                    return new_dict
+                elif isinstance(obj, list):
+                    return [decode_names(item) for item in obj]
+                return obj
 
-            # Process '+' in legend titles and values
+            # Decode all names in the custom config
+            custom_data = decode_names(custom_data)
+            
+            # Apply styles from custom config
             for init_source in custom_data.get('initSources', []):
                 if 'models' in init_source:
                     for model_key, model_value in init_source['models'].items():
+                        # Apply existing legends and styles from custom config
+                        # These override any SLD styles that were already applied
                         if 'legends' in model_value:
-                            # Corrected legends structure
-                            legends = model_value['legends']
-                            for legend in legends:
-                                if 'items' in legend:
-                                    for item in legend['items']:
-                                        if 'title' in item:
-                                            item['title'] = item['title'].replace('+', ' ')
-                            elemento['legends'] = legends
+                            elemento['legends'] = model_value['legends']
                         if 'styles' in model_value:
                             elemento['styles'] = model_value['styles']
                             if 'activeStyle' in model_value:
                                 elemento['activeStyle'] = model_value['activeStyle']
+                        if 'renderOptions' in model_value:
+                            elemento['renderOptions'] = model_value['renderOptions']
+                        if 'opacity' in model_value:
+                            elemento['opacity'] = model_value['opacity']
 
         except Exception as e:
             print(f"Error processing custom config for {resource_id}: {e}")
