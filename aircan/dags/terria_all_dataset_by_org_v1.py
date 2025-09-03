@@ -134,6 +134,13 @@ def process_sld_styles(style_url, resource_format):
                     
                     for i, rule in enumerate(rules):
                         try:
+                            # Check for ElseFilter first - these are fallback rules for unmatched values
+                            else_filter = rule.find('.//se:ElseFilter', namespaces)
+                            if else_filter is not None:
+                                # ElseFilter rules don't have specific property values, skip them for styling
+                                print(f"Rule {i+1}: Found ElseFilter - skipping for categorical styling")
+                                continue
+                            
                             # Enhanced rule processing
                             name = rule.find('se:Name', namespaces) or rule.find('sld:Name', namespaces) or rule.find('Name')
                             title = rule.find('.//se:Title', namespaces) or rule.find('.//sld:Title', namespaces) or rule.find('.//Title')
@@ -168,6 +175,11 @@ def process_sld_styles(style_url, resource_format):
                                 else:
                                     label = f"Style {i+1}"
 
+                                # Skip problematic "else" condition labels
+                                if "is ''" in label or "else" in label.lower():
+                                    print(f"Rule {i+1}: Skipping problematic label: '{label}'")
+                                    continue
+
                                 # Add to legend
                                 styles['legend_items'].append({
                                     "title": label,
@@ -186,6 +198,11 @@ def process_sld_styles(style_url, resource_format):
                                         valid_property_name = property_name
                                     elif valid_property_name != property_name:
                                         print(f"Warning: Multiple property names found: {valid_property_name} vs {property_name}")
+
+                                    # Skip problematic values
+                                    if not property_value or "is ''" in property_value or "else" in property_value.lower():
+                                        print(f"Rule {i+1}: Skipping problematic property value: '{property_value}'")
+                                        continue
 
                                     # For categorical data (geological codes, etc.), store as-is
                                     # TerriaJS enum mapping can handle non-numeric values
@@ -404,7 +421,14 @@ def format_dataset_item(resource, package_id, notes, org_info, view_index=0):
                 
                 # Common properties for both categorical and numeric
                 elemento['opacity'] = 0.8
-                # Note: Removed clampToGround and forceCesiumPrimitives as per updated plugin
+                
+                # GeoJsonTraits for shapefile rendering improvements
+                # These properties help with 3D positioning and rendering performance
+                elemento['clampToGround'] = True  # Default per TerriaJS docs, helps with geological layers
+                
+                # Only add forceCesiumPrimitives if we have complex styling that might benefit
+                if len(style_config['enum_colors']) > 10:
+                    elemento['forceCesiumPrimitives'] = True
                 
                 # Add legends
                 elemento['legends'] = [
@@ -414,14 +438,62 @@ def format_dataset_item(resource, package_id, notes, org_info, view_index=0):
                     }
                 ]
             else:
-                # If no valid property name, include legends if available
-                if style_config['legend_items']:
+                # If we have legend items but no proper styling, try to create basic categorical styling
+                if style_config['legend_items'] and style_config['enum_colors']:
+                    print(f"Attempting to create basic categorical styling with {len(style_config['legend_items'])} legend items")
+                    # Try to create a basic style with available data
+                    basic_enum_colors = []
+                    for item in style_config['legend_items']:
+                        basic_enum_colors.append({
+                            "value": item["title"],
+                            "color": item["color"]
+                        })
+                    
+                    if basic_enum_colors:
+                        # Create a basic categorical style
+                        elemento['styles'] = [{
+                            "id": "basic-categorical-style",
+                            "title": "Basic Categorical Style",
+                            "color": {
+                                "mapType": "enum",
+                                "colorColumn": style_config['property_name'] or "UNKNOWN_COLUMN",
+                                "enumColors": basic_enum_colors,
+                                "nullColor": "#808080"
+                            }
+                        }]
+                        elemento['activeStyle'] = "basic-categorical-style"
+                        elemento['opacity'] = 0.8
+                        elemento['clampToGround'] = True
+                        print(f"Created basic categorical style with {len(basic_enum_colors)} enum colors")
+                        
+                        # Add legends
+                        elemento['legends'] = [
+                            {
+                                "title": "Legend", 
+                                "items": style_config['legend_items']
+                            }
+                        ]
+                    else:
+                        # Fallback to legend-only styling
+                        elemento['legends'] = [
+                            {
+                                "title": "Legend",
+                                "items": style_config['legend_items']
+                            }
+                        ]
+                        elemento['opacity'] = 0.8
+                        elemento['clampToGround'] = True
+                        print(f"Applied legend-only styling with {len(style_config['legend_items'])} items")
+                elif style_config['legend_items']:
+                    # Only legends available
                     elemento['legends'] = [
                         {
                             "title": "Legend",
                             "items": style_config['legend_items']
                         }
                     ]
+                    elemento['opacity'] = 0.8
+                    elemento['clampToGround'] = True
                     print(f"Applied legend-only styling with {len(style_config['legend_items'])} items")
     
     # Process custom_config if available (can be combined with SLD styles)
