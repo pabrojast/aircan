@@ -430,7 +430,7 @@ def format_dataset_item(resource, package_id, notes, org_info, view_index=0):
                 # Only use for extremely complex datasets where performance is absolutely critical
                 enum_count = len(style_config['enum_colors'])
                 if enum_count > 100:
-                    elemento['forceCesiumPrimitives'] = True
+                    elemento['forceCesiumPrimitives'] = False
                     print(f"Applied forceCesiumPrimitives for extremely complex dataset ({enum_count} categories)")
                 else:
                     # Explicitly set to false for categorical styling to avoid conflicts
