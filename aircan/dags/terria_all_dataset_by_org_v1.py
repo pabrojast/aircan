@@ -111,7 +111,7 @@ def process_sld_styles(style_url, resource_format):
                 }
 
             elif resource_format in ['shp', 'shape']:
-                # Process vector styles for SHP files
+                # Process vector styles for SHP files using improved categorical approach
                 styles = {
                     'legend_items': [],
                     'enum_colors': [],
@@ -121,37 +121,85 @@ def process_sld_styles(style_url, resource_format):
                 valid_property_name = None  # To store a valid property name
 
                 try:
+                    # Enhanced SLD processing similar to the updated plugin
                     rules = root.findall('.//se:Rule', namespaces)
-                    for rule in rules:
-                        name = rule.find('se:Name', namespaces)
-                        title = rule.find('.//se:Title', namespaces)
-                        fill = rule.find('.//se:Fill/se:SvgParameter[@name="fill"]', namespaces)
-                        property_name_element = rule.find('.//ogc:PropertyName', namespaces)
-                        property_value_element = rule.find('.//ogc:Literal', namespaces)
+                    if not rules:
+                        # Try alternative namespace patterns
+                        rules = root.findall('.//sld:Rule', namespaces)
+                    if not rules:
+                        # Try without namespaces
+                        rules = root.findall('.//Rule')
+                    
+                    print(f"Found {len(rules)} rules in SLD")
+                    
+                    for i, rule in enumerate(rules):
+                        try:
+                            # Enhanced rule processing
+                            name = rule.find('se:Name', namespaces) or rule.find('sld:Name', namespaces) or rule.find('Name')
+                            title = rule.find('.//se:Title', namespaces) or rule.find('.//sld:Title', namespaces) or rule.find('.//Title')
+                            
+                            # Enhanced color extraction - try multiple patterns
+                            fill = (rule.find('.//se:Fill/se:SvgParameter[@name="fill"]', namespaces) or
+                                   rule.find('.//sld:Fill/sld:CssParameter[@name="fill"]', namespaces) or
+                                   rule.find('.//Fill/CssParameter[@name="fill"]') or
+                                   rule.find('.//se:PolygonSymbolizer/se:Fill/se:SvgParameter[@name="fill"]', namespaces))
+                            
+                            # Enhanced property extraction
+                            property_name_element = (rule.find('.//ogc:PropertyName', namespaces) or 
+                                                   rule.find('.//PropertyName'))
+                            property_value_element = (rule.find('.//ogc:Literal', namespaces) or 
+                                                    rule.find('.//Literal'))
 
-                        if fill is not None and (name is not None or title is not None):
-                            color = fill.text
-                            label = (title.text if title is not None else name.text) if name is not None else "Sin etiqueta"
+                            if fill is not None and fill.text and (name is not None or title is not None):
+                                color = fill.text.strip()
+                                
+                                # Normalize color to hex format
+                                if not color.startswith('#'):
+                                    if color.startswith('0x'):
+                                        color = '#' + color[2:]
+                                    elif len(color) == 6 and all(c in '0123456789ABCDEFabcdef' for c in color):
+                                        color = '#' + color
+                                
+                                # Generate label with better fallback
+                                if title is not None and title.text and title.text.strip():
+                                    label = title.text.strip()
+                                elif name is not None and name.text and name.text.strip():
+                                    label = name.text.strip()
+                                else:
+                                    label = f"Style {i+1}"
 
-                            # Add to legend
-                            styles['legend_items'].append({
-                                "title": label,
-                                "color": color
-                            })
-
-                            # Only process if property_name has a non-empty value
-                            if (property_name_element is not None and property_name_element.text and
-                                property_name_element.text.strip() and property_value_element is not None):
-
-                                property_value = property_value_element.text
-                                property_name = property_name_element.text.strip()
-                                valid_property_name = property_name  # Store property name for later use
-
-                                # Convert color to RGBA string (como en el plugin)
-                                styles['enum_colors'].append({
-                                    "value": property_value,
-                                    "color": f"rgba({int(color[1:3],16)},{int(color[3:5],16)},{int(color[5:7],16)},1)"
+                                # Add to legend
+                                styles['legend_items'].append({
+                                    "title": label,
+                                    "color": color.upper()  # Ensure uppercase hex
                                 })
+
+                                # Enhanced property processing for categorical data
+                                if (property_name_element is not None and property_name_element.text and
+                                    property_name_element.text.strip() and property_value_element is not None and
+                                    property_value_element.text):
+
+                                    property_value = property_value_element.text.strip()
+                                    property_name = property_name_element.text.strip()
+                                    
+                                    if not valid_property_name:
+                                        valid_property_name = property_name
+                                    elif valid_property_name != property_name:
+                                        print(f"Warning: Multiple property names found: {valid_property_name} vs {property_name}")
+
+                                    # For categorical data (geological codes, etc.), store as-is
+                                    # TerriaJS enum mapping can handle non-numeric values
+                                    styles['enum_colors'].append({
+                                        "value": property_value,
+                                        "color": color.upper()  # Use hex color for TerriaJS enum mapping
+                                    })
+                                    
+                                    print(f"Rule {i+1}: Added categorical mapping '{property_value}' -> {color.upper()}")
+                                    
+                        except Exception as rule_error:
+                            print(f"Error processing rule {i+1}: {rule_error}")
+                            continue
+                            
                 except Exception as e:
                     print(f"Error parsing SLD XML: {e}")
                     styles['legend_items'] = []
@@ -159,6 +207,7 @@ def process_sld_styles(style_url, resource_format):
                     
                 # Update property_name with valid_property_name
                 styles['property_name'] = valid_property_name
+                print(f"Processed SLD: {len(styles['legend_items'])} legend items, {len(styles['enum_colors'])} enum colors, property: {valid_property_name}")
                 return styles
             else:
                 return None
@@ -290,25 +339,77 @@ def format_dataset_item(resource, package_id, notes, org_info, view_index=0):
                 }
             ]
         elif resource_format in ['shp', 'shape']:
-            # For vector data (SHP files)
+            # For vector data (SHP files) using improved categorical styling
             if style_config['enum_colors'] and style_config['property_name']:
                 property_name = style_config['property_name']
-                elemento['styles'] = [{
-                    "id": property_name,
-                    "color": {
-                        "enumColors": style_config['enum_colors'],
-                        "colorPalette": "HighContrast"  # Agregar colorPalette para mejor visualización
-                    }
-                }]
-                elemento['activeStyle'] = property_name
+                
+                # Determine if data is numeric or categorical like in the updated plugin
+                numeric_count = 0
+                categorical_count = 0
+                
+                for enum_item in style_config['enum_colors']:
+                    try:
+                        float(enum_item['value'])
+                        numeric_count += 1
+                    except (ValueError, TypeError):
+                        categorical_count += 1
+                
+                # Use enum mapping for categorical data (which is typical for geological codes)
+                use_categorical = categorical_count > numeric_count
+                
+                if use_categorical:
+                    # Configure for categorical data using enum mapping
+                    elemento['styles'] = [{
+                        "id": "sld-style",
+                        "title": f"SLD Style ({property_name})",
+                        "color": {
+                            "mapType": "enum",
+                            "colorColumn": property_name,
+                            "enumColors": style_config['enum_colors'],
+                            "nullColor": "#808080"
+                        }
+                    }]
+                    elemento['activeStyle'] = "sld-style"
+                    print(f"Applied categorical enum styling with {len(style_config['enum_colors'])} mappings on column '{property_name}'")
+                else:
+                    # Configure for numeric data using bin mapping
+                    bin_maximums = []
+                    bin_colors = []
+                    
+                    # Sort enum_colors by numeric value for proper bin mapping
+                    sorted_enum_colors = sorted(style_config['enum_colors'], 
+                                              key=lambda x: float(x['value']) if x['value'].replace('.','',1).replace('-','',1).isdigit() else float('inf'))
+                    
+                    for enum_item in sorted_enum_colors:
+                        try:
+                            bin_maximums.append(float(enum_item['value']))
+                            bin_colors.append(enum_item['color'])
+                        except (ValueError, TypeError):
+                            continue
+                    
+                    if bin_maximums:
+                        elemento['styles'] = [{
+                            "id": "sld-style", 
+                            "title": f"SLD Style ({property_name})",
+                            "color": {
+                                "mapType": "bin",
+                                "colorColumn": property_name,
+                                "binMaximums": bin_maximums,
+                                "binColors": bin_colors,
+                                "nullColor": "#808080"
+                            }
+                        }]
+                        elemento['activeStyle'] = "sld-style"
+                        print(f"Applied numeric bin styling with {len(bin_maximums)} bins on column '{property_name}'")
+                
+                # Common properties for both categorical and numeric
                 elemento['opacity'] = 0.8
-                # Agregar propiedades adicionales para mejor renderizado
-                elemento['clampToGround'] = False
-                elemento['forceCesiumPrimitives'] = True
-                # Corrected legends structure
+                # Note: Removed clampToGround and forceCesiumPrimitives as per updated plugin
+                
+                # Add legends
                 elemento['legends'] = [
                     {
-                        "title": "Legend",
+                        "title": "Legend", 
                         "items": style_config['legend_items']
                     }
                 ]
@@ -321,6 +422,7 @@ def format_dataset_item(resource, package_id, notes, org_info, view_index=0):
                             "items": style_config['legend_items']
                         }
                     ]
+                    print(f"Applied legend-only styling with {len(style_config['legend_items'])} items")
     
     # Process custom_config if available (can be combined with SLD styles)
     if custom_config and custom_config not in ['NA', '']:
