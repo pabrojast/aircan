@@ -426,9 +426,16 @@ def format_dataset_item(resource, package_id, notes, org_info, view_index=0):
                 # These properties help with 3D positioning and rendering performance
                 elemento['clampToGround'] = True  # Default per TerriaJS docs, helps with geological layers
                 
-                # Only add forceCesiumPrimitives if we have complex styling that might benefit
-                if len(style_config['enum_colors']) > 10:
+                # Be very conservative with forceCesiumPrimitives - it can interfere with categorical styling
+                # Only use for extremely complex datasets where performance is absolutely critical
+                enum_count = len(style_config['enum_colors'])
+                if enum_count > 100:
                     elemento['forceCesiumPrimitives'] = True
+                    print(f"Applied forceCesiumPrimitives for extremely complex dataset ({enum_count} categories)")
+                else:
+                    # Explicitly set to false for categorical styling to avoid conflicts
+                    elemento['forceCesiumPrimitives'] = False
+                    print(f"Set forceCesiumPrimitives=false for categorical styling ({enum_count} categories)")
                 
                 # Add legends
                 elemento['legends'] = [
@@ -464,6 +471,7 @@ def format_dataset_item(resource, package_id, notes, org_info, view_index=0):
                         elemento['activeStyle'] = "basic-categorical-style"
                         elemento['opacity'] = 0.8
                         elemento['clampToGround'] = True
+                        elemento['forceCesiumPrimitives'] = False  # Always false for categorical
                         print(f"Created basic categorical style with {len(basic_enum_colors)} enum colors")
                         
                         # Add legends
@@ -483,6 +491,7 @@ def format_dataset_item(resource, package_id, notes, org_info, view_index=0):
                         ]
                         elemento['opacity'] = 0.8
                         elemento['clampToGround'] = True
+                        elemento['forceCesiumPrimitives'] = False  # Always false for categorical
                         print(f"Applied legend-only styling with {len(style_config['legend_items'])} items")
                 elif style_config['legend_items']:
                     # Only legends available
@@ -494,6 +503,7 @@ def format_dataset_item(resource, package_id, notes, org_info, view_index=0):
                     ]
                     elemento['opacity'] = 0.8
                     elemento['clampToGround'] = True
+                    elemento['forceCesiumPrimitives'] = False  # Always false for categorical
                     print(f"Applied legend-only styling with {len(style_config['legend_items'])} items")
     
     # Process custom_config if available (can be combined with SLD styles)
