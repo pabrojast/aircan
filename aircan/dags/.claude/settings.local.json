@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "additionalDirectories": [
+      "C:\\Users\\pablo\\Proyectos\\ckanext-terria_view"
+    ],
+    "allow": [
+      "Bash(find:*)"
+    ]
+  }
+}

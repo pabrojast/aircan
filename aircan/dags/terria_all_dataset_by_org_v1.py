@@ -3,6 +3,7 @@ import json
 from collections import defaultdict, Counter
 import xml.etree.ElementTree as ET
 import urllib.parse
+import re
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from airflow import DAG
@@ -62,18 +63,58 @@ def get_api_data(url):
 
 def process_sld_styles(style_url, resource_format):
     """
-    Retrieves and processes the SLD styles from the given URL.
+    Enhanced SLD processor with better error handling and TerriaJS compatibility.
     """
+    # Input validation
+    if not style_url or not isinstance(style_url, str):
+        print(f"Invalid SLD URL provided: {style_url}")
+        return None
+    
+    style_url = style_url.strip()
+    if not style_url or style_url.lower() in ['na', 'none', 'null']:
+        print("No valid SLD URL provided")
+        return None
+    
     try:
         response = http.get(style_url, timeout=TIMEOUT_SECONDS)
         if response.status_code == 200:
-            sld_xml = response.text
-            root = ET.fromstring(sld_xml)
-            # Define namespaces
+            sld_content = response.content
+            if not sld_content or len(sld_content.strip()) == 0:
+                print("SLD content is empty")
+                return None
+            
+            # Try different decoding approaches for better compatibility
+            content_str = None
+            try:
+                content_str = sld_content.decode('utf-8', errors='ignore')
+            except UnicodeDecodeError:
+                for encoding in ['latin-1', 'iso-8859-1', 'cp1252']:
+                    try:
+                        content_str = sld_content.decode(encoding, errors='ignore')
+                        break
+                    except UnicodeDecodeError:
+                        continue
+            
+            if not content_str:
+                print("Could not decode SLD content")
+                return None
+            
+            # Clean problematic characters
+            content_str = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', content_str)
+            
+            try:
+                root = ET.fromstring(content_str.encode('utf-8'))
+            except ET.ParseError as e:
+                print(f"XML parsing error: {e}")
+                return None
+            # Enhanced namespaces for better SLD compatibility
             namespaces = {
                 'sld': 'http://www.opengis.net/sld',
                 'se': 'http://www.opengis.net/se',
-                'ogc': 'http://www.opengis.net/ogc'
+                'ogc': 'http://www.opengis.net/ogc',
+                'xlink': 'http://www.w3.org/1999/xlink',
+                'gml': 'http://www.opengis.net/gml',
+                'ows': 'http://www.opengis.net/ows'
             }
 
             if resource_format in ['tif', 'tiff', 'geotiff', 'cog']:
@@ -134,6 +175,12 @@ def process_sld_styles(style_url, resource_format):
                     
                     for i, rule in enumerate(rules):
                         try:
+                            # Skip problematic rules that might cause issues - enhanced check
+                            rule_name = rule.get('name', '')
+                            if 'Else' in rule_name or 'else' in rule_name.lower():
+                                print(f"Rule {i+1}: Skipping else rule: {rule_name}")
+                                continue
+                            
                             # Check for ElseFilter first - these are fallback rules for unmatched values
                             else_filter = rule.find('.//se:ElseFilter', namespaces)
                             if else_filter is not None:
@@ -199,8 +246,12 @@ def process_sld_styles(style_url, resource_format):
                                     elif valid_property_name != property_name:
                                         print(f"Warning: Multiple property names found: {valid_property_name} vs {property_name}")
 
-                                    # Skip problematic values
-                                    if not property_value or "is ''" in property_value or "else" in property_value.lower():
+                                    # Skip problematic values - enhanced validation
+                                    if (not property_value or 
+                                        "is ''" in property_value or 
+                                        "else" in property_value.lower() or
+                                        property_value.strip() == '' or
+                                        property_value.lower() in ['null', 'none', 'undefined']):
                                         print(f"Rule {i+1}: Skipping problematic property value: '{property_value}'")
                                         continue
 
@@ -426,16 +477,10 @@ def format_dataset_item(resource, package_id, notes, org_info, view_index=0):
                 # These properties help with 3D positioning and rendering performance
                 elemento['clampToGround'] = True  # Default per TerriaJS docs, helps with geological layers
                 
-                # Be very conservative with forceCesiumPrimitives - it can interfere with categorical styling
-                # Only use for extremely complex datasets where performance is absolutely critical
-                enum_count = len(style_config['enum_colors'])
-                if enum_count > 100:
-                    elemento['forceCesiumPrimitives'] = False
-                    print(f"Applied forceCesiumPrimitives for extremely complex dataset ({enum_count} categories)")
-                else:
-                    # Explicitly set to false for categorical styling to avoid conflicts
-                    elemento['forceCesiumPrimitives'] = False
-                    print(f"Set forceCesiumPrimitives=false for categorical styling ({enum_count} categories)")
+                # Disable forceCesiumPrimitives for complex datasets to prevent conflicts in categorical styling
+                # This fix ensures proper categorical styling without rendering conflicts
+                elemento['forceCesiumPrimitives'] = False
+                print(f"Disabled forceCesiumPrimitives for categorical styling to prevent conflicts ({len(style_config['enum_colors'])} categories)")
                 
                 # Add legends
                 elemento['legends'] = [
@@ -471,7 +516,7 @@ def format_dataset_item(resource, package_id, notes, org_info, view_index=0):
                         elemento['activeStyle'] = "basic-categorical-style"
                         elemento['opacity'] = 0.8
                         elemento['clampToGround'] = True
-                        elemento['forceCesiumPrimitives'] = False  # Always false for categorical
+                        elemento['forceCesiumPrimitives'] = False  # Disabled to prevent conflicts in categorical styling
                         print(f"Created basic categorical style with {len(basic_enum_colors)} enum colors")
                         
                         # Add legends
@@ -491,7 +536,7 @@ def format_dataset_item(resource, package_id, notes, org_info, view_index=0):
                         ]
                         elemento['opacity'] = 0.8
                         elemento['clampToGround'] = True
-                        elemento['forceCesiumPrimitives'] = False  # Always false for categorical
+                        elemento['forceCesiumPrimitives'] = False  # Disabled to prevent conflicts in categorical styling
                         print(f"Applied legend-only styling with {len(style_config['legend_items'])} items")
                 elif style_config['legend_items']:
                     # Only legends available
@@ -503,7 +548,7 @@ def format_dataset_item(resource, package_id, notes, org_info, view_index=0):
                     ]
                     elemento['opacity'] = 0.8
                     elemento['clampToGround'] = True
-                    elemento['forceCesiumPrimitives'] = False  # Always false for categorical
+                    elemento['forceCesiumPrimitives'] = False  # Disabled to prevent conflicts in categorical styling
                     print(f"Applied legend-only styling with {len(style_config['legend_items'])} items")
     
     # Process custom_config if available (can be combined with SLD styles)
