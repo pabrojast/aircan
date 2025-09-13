@@ -127,20 +127,36 @@ def process_sld_styles(style_url, resource_format):
                         quantity = entry.get('quantity')
                         color = entry.get('color')
                         label = entry.get('label', '')
+                        opacity = entry.get('opacity', '1.0')
 
-                        # Convert color to RGB string
-                        if color.startswith('#'):
-                            hex_color = color.lstrip('#')
-                            rgb = tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
-                            rgb_string = f"rgb({rgb[0]}, {rgb[1]}, {rgb[2]})"
-                        else:
-                            rgb_string = color
+                        if quantity and color:
+                            try:
+                                quantity_val = float(quantity)
+                                opacity_val = float(opacity)
 
-                        colors.append([float(quantity), rgb_string])
-                        legend_items.append({
-                            "title": label,
-                            "color": color
-                        })
+                                # Convert color to RGB string
+                                if color.startswith('#'):
+                                    hex_color = color.lstrip('#')
+                                    rgb = tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+                                    if opacity_val < 1.0:
+                                        rgb_string = f"rgba({rgb[0]}, {rgb[1]}, {rgb[2]}, {opacity_val})"
+                                    else:
+                                        rgb_string = f"rgb({rgb[0]}, {rgb[1]}, {rgb[2]})"
+                                else:
+                                    rgb_string = color
+
+                                colors.append([quantity_val, rgb_string])
+
+                                # Create legend entry
+                                legend_title = label if label else f"{quantity_val}"
+                                legend_items.append({
+                                    "title": legend_title,
+                                    "color": rgb_string
+                                })
+                            except ValueError as e:
+                                print(f"Error processing color map entry: {e}")
+                                continue
+
                 except Exception as e:
                     print(f"Error parsing SLD XML: {e}")
                     colors = []
@@ -391,19 +407,54 @@ def format_dataset_item(resource, package_id, notes, org_info, view_index=0):
     # Apply styles from SLD if available
     if style_config:
         if resource_format in ['cog', 'tif', 'tiff', 'geotiff']:
-            # For raster data (COG files)
-            elemento['renderOptions'] = {
+            # For raster data (COG files) - Apply enhanced processing similar to the updated plugin
+            colors = style_config['colors']
+            legend_items = style_config['legend_items']
+
+            # Filter out transparent/nodata values for binary masks
+            # If a color entry has opacity 0, it should be treated as nodata, not as a color to render
+            filtered_colors = []
+            nodata_values = []
+
+            for quantity_val, rgb_string in colors:
+                if rgb_string.startswith("rgba(") and ", 0.0)" in rgb_string:
+                    # This is a fully transparent color, treat as nodata
+                    nodata_values.append(quantity_val)
+                else:
+                    filtered_colors.append([quantity_val, rgb_string])
+
+            # Build renderOptions with enhanced transparency handling
+            render_options = {
                 "single": {
-                    "colors": style_config['colors'],
-                    "useRealValue": True
+                    "colors": filtered_colors if filtered_colors else colors,
+                    "useRealValue": True,
+                    "type": "discrete"
                 }
             }
+
+            # Add nodata specification if we found transparent values
+            if nodata_values:
+                render_options["nodata"] = nodata_values[0] if len(nodata_values) == 1 else nodata_values
+
+            # Set domain to help TerriaJS calculate min/max for binary masks
+            all_quantities = [quantity_val for quantity_val, _ in colors]
+            if nodata_values:
+                all_quantities.extend(nodata_values)
+
+            if all_quantities:
+                min_val = min(all_quantities)
+                max_val = max(all_quantities)
+                # Set domain for the single band
+                render_options["single"]["domain"] = [min_val, max_val]
+
+            elemento['renderOptions'] = render_options
             elemento['opacity'] = 0.8
+
             # Corrected legends structure
             elemento['legends'] = [
                 {
                     "title": "Legend",
-                    "items": style_config['legend_items']
+                    "items": legend_items
                 }
             ]
         elif resource_format in ['shp', 'shape']:
