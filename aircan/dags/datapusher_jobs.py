@@ -47,7 +47,7 @@ def get_datapusher_jobs(ckan_site_url):
 
 
 def resubmit_datapusher(ckan_site_url, ckan_api_key, resource_id):
-    header = {'X-CKAN-API-Key': ckan_api_key}
+    header = {'API-Key': ckan_api_key}
     try:
         response = requests.post(
             urljoin(ckan_site_url, '/api/3/action/datapusher_submit'),

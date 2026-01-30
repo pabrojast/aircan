@@ -31,7 +31,7 @@ def fetch_and_read(resource_dict, site_url, api_key):
     try:
         headers = {}
         if urlparse(resource_dict['path']).netloc == urlparse(site_url).netloc:
-            headers = {'X-CKAN-API-Key': api_key}
+            headers = {'API-Key': api_key}
         resource_tmp_file, file_hash = download_resource_file(resource_dict['path'], headers, delete=False)
         logging.info('File hash: {0}'.format(file_hash))
         resource = describe(path=resource_tmp_file.name, type="resource")
@@ -72,7 +72,7 @@ def compare_schema(site_url, ckan_api_key, res_dict, schema):
         url = urljoin(site_url, '/api/3/action/datastore_search')
         response = requests.get(url,
                         params={'resource_id': res_id, 'limit': 0},
-                        headers={'X-CKAN-API-Key': ckan_api_key}
+                        headers={'API-Key': ckan_api_key}
                     )
         if response.status_code == 200:
             resource_json = response.json()
@@ -129,7 +129,7 @@ def compare_schema(site_url, ckan_api_key, res_dict, schema):
             'Failed to fetch data dictionary for {0}'.format(res_id), str(err))
 
 def delete_datastore_table(data_resource_id, ckan_api_key, ckan_site_url):
-    header = {'X-CKAN-API-Key': ckan_api_key}
+    header = {'API-Key': ckan_api_key}
     try:
         response = requests.post(
             urljoin(ckan_site_url, '/api/3/action/datastore_delete'),
@@ -166,7 +166,7 @@ def create_datastore_table(data_resource_id, schema, ckan_api_key, ckan_site_url
     try:
         response = requests.post(
             urljoin(ckan_site_url, '/api/3/action/datastore_create'),
-            headers={'X-CKAN-API-Key': ckan_api_key},
+            headers={'API-Key': ckan_api_key},
             json=data_dict
         )
         if response.status_code == 200:
@@ -215,7 +215,7 @@ def load_resource_via_api(resource_dict, ckan_api_key, ckan_site_url, chunk_size
                 response = requests.post(url,
                                 data=json.dumps(payload, cls=DatastoreEncoder),
                                 headers={'Content-Type': 'application/json',
-                                        'X-CKAN-API-Key': ckan_api_key})
+                                        'API-Key': ckan_api_key})
                 response.raise_for_status()
                 if response.status_code == 200:
                      logging.info('Ingested {number} of records.'.format(number=i))
@@ -250,7 +250,7 @@ def generate_file_and_load_to_GCP(resource_dict, ckan_config):
     dump_url = join_path(site_url, 'datastore','dump', resource_id)
     
     try:
-        headers = {'X-CKAN-API-Key': api_key}
+        headers = {'API-Key': api_key}
         tmp_file, file_hash = download_resource_file(dump_url, headers)
         logging.info('File hash: {0}'.format(file_hash))
         s3uploder = s3Uploader(
