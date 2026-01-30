@@ -777,7 +777,7 @@ def upload_ckan(file_path, entity_name=None, entity_type='organization'):
         entity_name (str): Name of the organization or tag (optional)
         entity_type (str): Type of the entity ('organization' or 'tag')
     """
-    headers = {"Authorization": APIdev}
+    headers = {"X-CKAN-API-Key": APIdev}
 
     # Get the ID of the package
     package_show_url = f"{ckan_api_url}package_show"
