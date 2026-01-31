@@ -95,7 +95,7 @@ def aircan_status_update(site_url, ckan_api_key, status_dict):
         response = requests.post(url,
                         data=json.dumps(request_data),
                         headers={'Content-Type': 'application/json',
-                                'API-Key': ckan_api_key})
+                                'Authorization': ckan_api_key})
         if response.status_code == 200:
             resource_json = response.json()
             logging.info('Loading status updated successfully in CKAN.')
@@ -186,7 +186,7 @@ def email_dispatcher(context, api_key, site_url):
                                                         resource_dict['package_id']))
         response = requests.get(url,
                         headers={'Content-Type': 'application/json',
-                                'API-Key': api_key})
+                                'Authorization': api_key})
         if response.status_code == 200:
             package_dict = response.json()
 

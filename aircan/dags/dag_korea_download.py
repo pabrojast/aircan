@@ -249,7 +249,7 @@ def retry(func, max_attempts=3, sleep_time=5):
 # Resource Patch (CKAN Upload)
 def upload_ckan(name='Daily Water Level Data', description='Test Data', url='https://data.dev-wins.com/api/action/resource_patch', pathtofile="daily_wl_data.csv", resource_id="XXXXXX", package_id="YYYYYY"):
     files = {'upload': open(pathtofile, 'rb')}
-    headers = {"API-Key": APIdev}
+    headers = {"Authorization": APIdev}
     data_dict = {
         'id': resource_id,
         'package_id': package_id,

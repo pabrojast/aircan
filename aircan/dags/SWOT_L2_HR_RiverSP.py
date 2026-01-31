@@ -174,7 +174,7 @@ def upload_ckan(
         if os.path.isfile(file_path):
             try:
                 files = {'upload': open(file_path, 'rb')}
-                headers = {"API-Key": APIdev}
+                headers = {"Authorization": APIdev}
                 
                 data_dict = {
                     'package_id': package_id,
@@ -200,7 +200,7 @@ def upload_ckan(
 def get_resource_views(resource_id, api_url, api_key):
     """Get list of views for a specific resource"""
     headers = {
-        'API-Key': api_key
+        'Authorization': api_key
     }
     
     view_list_url = f"{api_url}/api/3/action/resource_view_list"
@@ -217,7 +217,7 @@ def get_resource_views(resource_id, api_url, api_key):
 def update_resource_view(view_id, view_data, api_url, api_key):
     """Update a specific resource view"""
     headers = {
-        'API-Key': api_key,
+        'Authorization': api_key,
         'Content-Type': 'application/json'
     }
     
