@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import random
+import shutil
 import stat
 import tempfile
 import time
@@ -103,6 +104,24 @@ def require_value(name: str, value: str) -> str:
 
 def iso_z(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def log_step(message: str) -> None:
+    print(message, flush=True)
+    logger.info(message)
+
+
+def log_disk_usage(path: Path, label: str) -> None:
+    try:
+        total, used, free = shutil.disk_usage(path)
+        msg = (
+            f"{label} disk usage at {path} | "
+            f"total_gb={total / 1e9:.2f} used_gb={used / 1e9:.2f} free_gb={free / 1e9:.2f}"
+        )
+        print(msg, flush=True)
+        logger.info(msg)
+    except Exception as exc:
+        logger.warning("Could not read disk usage for %s: %s", path, exc)
 
 
 def request_with_retries(
@@ -193,12 +212,18 @@ def create_runtime_netrc(nasa_username: str, nasa_password: str) -> Path:
 
 
 def earthaccess_login_airflow_style(nasa_username: str, nasa_password: str) -> Path:
+    log_step("STEP 1: creating runtime .netrc")
     netrc_path = create_runtime_netrc(nasa_username, nasa_password)
+    log_step(f"STEP 1 DONE: .netrc created at {netrc_path}")
+
+    log_step("STEP 2: logging into Earthaccess via netrc")
     earthaccess.login(strategy="netrc")
+    log_step("STEP 2 DONE: Earthaccess login succeeded")
     return netrc_path
 
 
 def get_latest_matching_earthaccess_granule(short_name: str, region_prefix: str):
+    log_step(f"STEP 3: searching Earthaccess short_name={short_name} region_prefix={region_prefix}")
     granules = earthaccess.search_data(short_name=short_name, count=500)
     eu_granules = []
     for granule in granules:
@@ -215,6 +240,7 @@ def get_latest_matching_earthaccess_granule(short_name: str, region_prefix: str)
         eu_granules,
         key=lambda x: sort_key_from_filename(x[0]),
     )[-1]
+    log_step(f"STEP 3 DONE: latest Earthaccess native-id={latest_name}")
     return latest_name, latest_granule
 
 
@@ -228,15 +254,33 @@ def get_runtime_temp_dir(configured_dir: str = "") -> Path:
 
 def download_granule_to_local(granule, local_tmp_dir: Path) -> Path:
     local_tmp_dir.mkdir(parents=True, exist_ok=True)
+    log_step(f"STEP 4: starting DAWG download into {local_tmp_dir}")
+    log_disk_usage(local_tmp_dir, "BEFORE DOWNLOAD")
     paths = earthaccess.download([granule], local_path=str(local_tmp_dir))
     if not paths:
         raise RuntimeError("earthaccess.download returned no files.")
-    return Path(paths[0])
+    local_path = Path(paths[0])
+    log_step(f"STEP 4 DONE: DAWG download completed: {local_path}")
+    log_disk_usage(local_tmp_dir, "AFTER DOWNLOAD")
+    try:
+        size_gb = local_path.stat().st_size / 1e9
+        log_step(f"Downloaded file size_gb={size_gb:.2f}")
+    except Exception:
+        pass
+    return local_path
 
 
 def upload_file_to_blob(container: ContainerClient, local_path: Path, blob_name: str) -> None:
+    try:
+        size_gb = local_path.stat().st_size / 1e9
+        log_step(f"STEP 5: uploading {local_path.name} to Azure as {blob_name} size_gb={size_gb:.2f}")
+    except Exception:
+        log_step(f"STEP 5: uploading {local_path.name} to Azure as {blob_name}")
+
     with local_path.open("rb") as file_handle:
         container.get_blob_client(blob_name).upload_blob(file_handle, overwrite=True)
+
+    log_step(f"STEP 5 DONE: Azure upload finished: {blob_name}")
 
 
 def delete_other_nc_blobs_in_prefix(
@@ -297,6 +341,7 @@ def get_last_time_dt(existing: pd.DataFrame) -> Optional[datetime]:
 
 
 def open_dawg(nc_path: str):
+    log_step(f"STEP 6: opening NetCDF {nc_path}")
     ds = nc.Dataset(nc_path, "r")
     reaches = ds.groups["reaches"]
     consensus = ds.groups["consensus"]
@@ -313,6 +358,7 @@ def open_dawg(nc_path: str):
     elif "missing_value" in qvar.ncattrs():
         missing = qvar.getncattr("missing_value")
 
+    log_step(f"STEP 6 DONE: NetCDF opened successfully with {len(id_to_idx)} reach ids")
     return ds, id_to_idx, time_var, qvar, missing
 
 
@@ -577,7 +623,10 @@ def update_reach_csvs(
     timeout_s: int,
     max_retries: int,
 ) -> Dict[str, int]:
+    log_step("STEP 7: starting reach CSV updates")
     reach_ids = load_reach_ids_from_geojson(geojson_url, timeout_s, max_retries)
+    log_step(f"STEP 7 INFO: loaded {len(reach_ids)} reach ids from GeoJSON")
+
     ds, id_to_idx, time_var, qvar, missing = open_dawg(str(local_nc_path))
 
     updated_count = 0
@@ -587,6 +636,13 @@ def update_reach_csvs(
 
     try:
         for i, rid in enumerate(reach_ids, start=1):
+            if i == 1 or i % 100 == 0:
+                log_step(
+                    f"STEP 7 PROGRESS: processing reach {i}/{len(reach_ids)} "
+                    f"updated={updated_count} no_change={no_change_count} "
+                    f"missing_csv={missing_csv_count} errors={error_count}"
+                )
+
             blob_name = f"{azure_csv_prefix}/reach_{safe_reach_filename(rid)}.csv"
             existing_text = download_blob_text(container, blob_name)
 
@@ -641,13 +697,15 @@ def update_reach_csvs(
     finally:
         ds.close()
 
-    return {
+    summary = {
         "total_reaches": len(reach_ids),
         "updated": updated_count,
         "no_change": no_change_count,
         "missing_csv": missing_csv_count,
         "errors": error_count,
     }
+    log_step(f"STEP 7 DONE: CSV update summary={summary}")
+    return summary
 
 
 def update_geojson_resource(
@@ -660,6 +718,8 @@ def update_geojson_resource(
     max_retries: int,
     runtime_temp_dir: Path,
 ) -> Dict[str, Any]:
+    log_step("STEP 8: starting GeoJSON update")
+
     download_session = requests.Session()
     ckan_session = requests.Session()
     ckan_session.headers.update({"Authorization": ckan_api_key, "X-CKAN-API-Key": ckan_api_key})
@@ -683,6 +743,7 @@ def update_geojson_resource(
 
     local_geojson_path = runtime_temp_dir / geojson_filename
     save_geojson(updated_geojson, local_geojson_path)
+    log_step(f"STEP 8 INFO: local GeoJSON written to {local_geojson_path}")
 
     response = upload_geojson_resource(
         session=ckan_session,
@@ -699,10 +760,13 @@ def update_geojson_resource(
 
     summary["upload_succeeded"] = True
     summary["local_geojson_path"] = str(local_geojson_path.resolve())
+    log_step(f"STEP 8 DONE: GeoJSON update summary={summary}")
     return summary
 
 
 def run_weekly_dawg_csv_geojson_update() -> Dict[str, Any]:
+    log_step("RUN START: weekly DAWG CSV + GeoJSON update")
+
     azure_storage_connection_string = require_value(
         "AZURE_STORAGE_CONNECTION_STRING",
         vget("AZURE_STORAGE_CONNECTION_STRING", ""),
@@ -743,43 +807,49 @@ def run_weekly_dawg_csv_geojson_update() -> Dict[str, Any]:
         "geojson_summary": None,
     }
 
-    logger.info("Starting weekly DAWG CSV + GeoJSON update.")
+    print(f"Runtime temp dir: {runtime_temp_dir}", flush=True)
+    log_disk_usage(runtime_temp_dir, "INITIAL")
+    log_step("Config and runtime environment loaded successfully")
+
     earthaccess_login_airflow_style(nasa_username, nasa_password)
 
+    log_step("STEP 0: connecting to Azure container")
     container = get_container(azure_storage_connection_string, azure_container_name)
+    log_step(f"STEP 0 DONE: connected to Azure container={azure_container_name}")
 
     current_azure_filename = get_current_azure_latest_filename(container, azure_dawg_blob_prefix)
     current_azure_name_no_ext = strip_nc_extension(current_azure_filename)
     result["current_azure_filename"] = current_azure_filename
-    logger.info("Current Azure DAWG file: %s", current_azure_filename)
+    log_step(f"Current Azure DAWG file: {current_azure_filename}")
 
     latest_remote_native_id, latest_remote_granule = get_latest_matching_earthaccess_granule(
         dawg_short_name,
         dawg_region_prefix,
     )
     result["latest_remote_native_id"] = latest_remote_native_id
-    logger.info("Latest Earthaccess EU native-id: %s", latest_remote_native_id)
+    log_step(f"Latest Earthaccess EU native-id: {latest_remote_native_id}")
 
     if current_azure_name_no_ext == latest_remote_native_id:
-        logger.info("Azure already has the newest DAWG file. Exiting without CSV or GeoJSON updates.")
+        log_step("No new DAWG detected. Exiting without CSV or GeoJSON updates.")
         return result
 
     result["new_dawg_detected"] = True
+    log_step("New DAWG detected. Proceeding with download/upload/update workflow.")
 
     local_nc_path = download_granule_to_local(latest_remote_granule, runtime_temp_dir)
-    logger.info("Downloaded new DAWG file: %s", local_nc_path)
 
     target_filename = add_nc_extension(latest_remote_native_id)
     target_blob_name = safe_blob_join(azure_dawg_blob_prefix, target_filename)
 
     upload_file_to_blob(container, local_nc_path, target_blob_name)
     result["uploaded_blob_name"] = target_blob_name
-    logger.info("Uploaded new DAWG blob: %s", target_blob_name)
 
     deleted_old_blobs = delete_other_nc_blobs_in_prefix(container, azure_dawg_blob_prefix, target_filename)
     result["deleted_old_blobs"] = deleted_old_blobs
     if deleted_old_blobs:
-        logger.info("Deleted %d older DAWG blob(s).", len(deleted_old_blobs))
+        log_step(f"Deleted {len(deleted_old_blobs)} older DAWG blob(s)")
+    else:
+        log_step("No older DAWG blobs to delete")
 
     result["csv_summary"] = update_reach_csvs(
         container=container,
@@ -792,7 +862,6 @@ def run_weekly_dawg_csv_geojson_update() -> Dict[str, Any]:
         timeout_s=timeout_s,
         max_retries=max_retries,
     )
-    logger.info("CSV update summary: %s", result["csv_summary"])
 
     try:
         result["geojson_summary"] = update_geojson_resource(
@@ -808,8 +877,8 @@ def run_weekly_dawg_csv_geojson_update() -> Dict[str, Any]:
     except Exception as exc:
         raise RuntimeError(f"CKAN GeoJSON update failed: {format_ckan_error(exc)}") from exc
 
-    logger.info("GeoJSON update summary: %s", result["geojson_summary"])
-    logger.info("Weekly DAWG CSV + GeoJSON update completed successfully.")
+    log_disk_usage(runtime_temp_dir, "FINAL")
+    log_step("RUN DONE: weekly DAWG CSV + GeoJSON update completed successfully")
     return result
 
 
