@@ -23,6 +23,7 @@ import logging
 import os
 import random
 import stat
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -38,10 +39,9 @@ from azure.core.exceptions import ResourceNotFoundError
 from azure.storage.blob import BlobServiceClient, ContainerClient, ContentSettings
 from pandas.errors import EmptyDataError
 
-try:
-    from airflow.models import Variable
-except Exception:  # pragma: no cover - script also runs outside Airflow
-    Variable = None
+from airflow import DAG
+from airflow.models import Variable
+from airflow.operators.python import PythonOperator
 
 
 logger = logging.getLogger(__name__)
@@ -63,7 +63,7 @@ DEFAULT_PUBLIC_CSV_BASE_URL = (
 
 DEFAULT_DAWG_SHORT_NAME = "SWOT_L4_HR_DAWG_SOS_DISCHARGE_V3"
 DEFAULT_DAWG_REGION_PREFIX = "eu_"
-DEFAULT_LOCAL_TMP_DIR = "./tmp_dawg_downloads"
+DEFAULT_DAWG_DOWNLOAD_TMP_DIR = ""
 
 DEFAULT_GEOJSON_URL = (
     "https://ihp-wins.unesco.org/dataset/811c5aef-99e8-46e8-a708-12972138b70d/"
@@ -216,6 +216,14 @@ def get_latest_matching_earthaccess_granule(short_name: str, region_prefix: str)
         key=lambda x: sort_key_from_filename(x[0]),
     )[-1]
     return latest_name, latest_granule
+
+
+def get_runtime_temp_dir(configured_dir: str = "") -> Path:
+    if configured_dir.strip():
+        temp_dir = Path(configured_dir)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        return temp_dir
+    return Path(tempfile.mkdtemp(prefix="weekly_dawg_"))
 
 
 def download_granule_to_local(granule, local_tmp_dir: Path) -> Path:
@@ -650,6 +658,7 @@ def update_geojson_resource(
     ckan_api_key: str,
     timeout_s: int,
     max_retries: int,
+    runtime_temp_dir: Path,
 ) -> Dict[str, Any]:
     download_session = requests.Session()
     ckan_session = requests.Session()
@@ -672,7 +681,7 @@ def update_geojson_resource(
         timeout_s,
     )
 
-    local_geojson_path = Path(geojson_filename)
+    local_geojson_path = runtime_temp_dir / geojson_filename
     save_geojson(updated_geojson, local_geojson_path)
 
     response = upload_geojson_resource(
@@ -712,7 +721,7 @@ def run_weekly_dawg_csv_geojson_update() -> Dict[str, Any]:
 
     dawg_short_name = vget("SWOT_DAWG_SHORT_NAME", DEFAULT_DAWG_SHORT_NAME)
     dawg_region_prefix = vget("SWOT_DAWG_REGION_PREFIX", DEFAULT_DAWG_REGION_PREFIX)
-    local_tmp_dir = Path(vget("SWOT_DAWG_DOWNLOAD_DIR", DEFAULT_LOCAL_TMP_DIR))
+    runtime_temp_dir = get_runtime_temp_dir(vget("SWOT_DAWG_DOWNLOAD_TMP_DIR", DEFAULT_DAWG_DOWNLOAD_TMP_DIR))
 
     geojson_url = vget("SWOT_GEOJSON_URL", DEFAULT_GEOJSON_URL)
     ckan_resource_id = vget("SWOT_CKAN_RESOURCE_ID", DEFAULT_CKAN_RESOURCE_ID)
@@ -757,7 +766,7 @@ def run_weekly_dawg_csv_geojson_update() -> Dict[str, Any]:
 
     result["new_dawg_detected"] = True
 
-    local_nc_path = download_granule_to_local(latest_remote_granule, local_tmp_dir)
+    local_nc_path = download_granule_to_local(latest_remote_granule, runtime_temp_dir)
     logger.info("Downloaded new DAWG file: %s", local_nc_path)
 
     target_filename = add_nc_extension(latest_remote_native_id)
@@ -794,6 +803,7 @@ def run_weekly_dawg_csv_geojson_update() -> Dict[str, Any]:
             ckan_api_key=ckan_api_key,
             timeout_s=timeout_s,
             max_retries=max_retries,
+            runtime_temp_dir=runtime_temp_dir,
         )
     except Exception as exc:
         raise RuntimeError(f"CKAN GeoJSON update failed: {format_ckan_error(exc)}") from exc
@@ -803,7 +813,24 @@ def run_weekly_dawg_csv_geojson_update() -> Dict[str, Any]:
     return result
 
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    output = run_weekly_dawg_csv_geojson_update()
-    print(json.dumps(output, indent=2, default=str))
+default_args = {
+    "owner": "airflow",
+    "depends_on_past": False,
+    "start_date": datetime(2026, 3, 13),
+    "retries": 1,
+    "retry_delay": timedelta(minutes=10),
+}
+
+with DAG(
+    dag_id="weekly_dawg_csv_geojson_update",
+    default_args=default_args,
+    description="Weekly DAWG NetCDF rotation plus DAWG-only consensus_q CSV and CKAN GeoJSON updates",
+    schedule_interval="0 8 * * 1",
+    catchup=False,
+    max_active_runs=1,
+    tags=["swot", "dawg", "azure", "ckan", "unesco", "dnipro", "weekly"],
+) as dag:
+    run_update = PythonOperator(
+        task_id="run_weekly_dawg_csv_geojson_update",
+        python_callable=run_weekly_dawg_csv_geojson_update,
+    )
