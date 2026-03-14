@@ -676,17 +676,57 @@ def update_reach_csvs(
                 continue
 
             existing_df = safe_read_csv_text(existing_text)
+
+            # Decide backfill start time.
+            # Priority:
+            #   1) If CSV is empty -> small default backfill window
+            #   2) If consensus_q has missing values -> start from earliest missing consensus_q timestamp
+            #   3) Otherwise -> normal incremental overlap window based on latest timestamp
             if existing_df.empty:
                 start_dt = run_end_dt - timedelta(days=backfill_days_if_empty)
+                logger.info(
+                    "[%d/%d] %s existing CSV empty, using backfill window start=%s",
+                    i, len(reach_ids), rid, start_dt
+                )
             else:
-                last_dt = get_last_time_dt(existing_df)
-                if last_dt is None:
-                    start_dt = run_end_dt - timedelta(days=backfill_days_if_empty)
+                if "time_utc" not in existing_df.columns:
+                    raise RuntimeError(f"Existing CSV for reach {rid} is missing required column 'time_utc'.")
+                if "consensus_q" not in existing_df.columns:
+                    raise RuntimeError(f"Existing CSV for reach {rid} is missing required column 'consensus_q'.")
+
+                df_tmp = existing_df.copy()
+                df_tmp["time_parsed"] = pd.to_datetime(df_tmp["time_utc"], errors="coerce", utc=True)
+                df_tmp["consensus_q_num"] = pd.to_numeric(df_tmp["consensus_q"], errors="coerce")
+
+                missing_q_mask = df_tmp["time_parsed"].notna() & df_tmp["consensus_q_num"].isna()
+
+                if missing_q_mask.any():
+                    start_dt = df_tmp.loc[missing_q_mask, "time_parsed"].min().to_pydatetime()
+                    logger.info(
+                        "[%d/%d] %s missing consensus_q detected, repairing from %s",
+                        i, len(reach_ids), rid, start_dt
+                    )
                 else:
-                    start_dt = last_dt - timedelta(hours=overlap_hours)
+                    last_dt = get_last_time_dt(existing_df)
+                    if last_dt is None:
+                        start_dt = run_end_dt - timedelta(days=backfill_days_if_empty)
+                        logger.info(
+                            "[%d/%d] %s no valid last_dt found, using backfill window start=%s",
+                            i, len(reach_ids), rid, start_dt
+                        )
+                    else:
+                        start_dt = last_dt - timedelta(hours=overlap_hours)
+                        logger.info(
+                            "[%d/%d] %s incremental update window start=%s end=%s",
+                            i, len(reach_ids), rid, start_dt, run_end_dt
+                        )
 
             if start_dt >= run_end_dt:
                 start_dt = run_end_dt - timedelta(days=1)
+                logger.info(
+                    "[%d/%d] %s adjusted start_dt because it was >= run_end_dt; new start=%s",
+                    i, len(reach_ids), rid, start_dt
+                )
 
             try:
                 dawg_new = fetch_dawg_window(
@@ -705,9 +745,10 @@ def update_reach_csvs(
                     continue
 
                 out_df = update_existing_csv_consensus_q(existing_df, dawg_new)
+
                 if out_df.equals(existing_df):
                     no_change_count += 1
-                    logger.info("[%d/%d] %s no change", i, len(reach_ids), rid)
+                    logger.info("[%d/%d] %s no change after DAWG merge", i, len(reach_ids), rid)
                     continue
 
                 buffer = io.StringIO()
@@ -715,10 +756,15 @@ def update_reach_csvs(
                 upload_blob_text(container, blob_name, buffer.getvalue())
 
                 updated_count += 1
-                logger.info("[%d/%d] %s updated rows=%d", i, len(reach_ids), rid, len(out_df))
+                logger.info(
+                    "[%d/%d] %s updated rows=%d fetched_dawg_rows=%d",
+                    i, len(reach_ids), rid, len(out_df), len(dawg_new)
+                )
+
             except Exception as exc:
                 error_count += 1
                 logger.exception("[%d/%d] %s CSV update failed: %s", i, len(reach_ids), rid, exc)
+
     finally:
         ds.close()
 
