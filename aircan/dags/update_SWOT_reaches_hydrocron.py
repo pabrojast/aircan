@@ -1,37 +1,18 @@
 """
 Airflow DAG: SWOT Hydrocron -> Azure incremental per-reach CSV updater
 
-What this DAG does (daily):
-  1) Downloads reach_ids from a public GeoJSON (CKAN resource URL)
+Daily workflow:
+  1) Load reach_ids from public GeoJSON
   2) For each reach_id:
-      - downloads existing per-reach CSV from Azure Blob Storage (if present)
-      - finds latest time_str in that CSV
-      - queries Hydrocron for [last_time - overlap, now]
-      - cleans + de-dups by time_str
-      - uploads updated CSV back to Azure
-  3) Writes a run log CSV to Azure: {AZURE_PREFIX}/update_log_daily.csv
+      - download existing per-reach CSV from Azure Blob Storage (if present)
+      - find latest time_utc in that CSV
+      - query Hydrocron for [last_time - overlap, now]
+      - clean, mask fill values, de-dup by time_utc
+      - upload updated CSV back to Azure
+  3) Write a run log CSV to Azure
 
-Required Airflow Variables (recommended):
-  - AZURE_STORAGE_CONNECTION_STRING   (string)
-
-Optional Airflow Variables (override defaults without redeploying code):
-  - SWOT_GEOJSON_URL
-  - SWOT_REACH_ID_FIELD
-  - SWOT_HYDROCRON_URL
-  - SWOT_COLLECTION_NAME
-  - SWOT_FIELDS
-  - SWOT_AZURE_CONTAINER
-  - SWOT_AZURE_PREFIX
-  - SWOT_OVERLAP_HOURS
-  - SWOT_DEFAULT_BACKFILL_DAYS_IF_EMPTY
-  - SWOT_MAX_RETRIES
-  - SWOT_TIMEOUT_S
-  - SWOT_SLEEP_MIN_S
-  - SWOT_SLEEP_MAX_S
-
-Notes:
-  - This file must live in your Airflow DAGs folder (e.g., dags/swot_hydrocron_update.py)
-  - Do NOT execute logic at import time; everything runs inside run_swot_hydrocron_incremental_update().
+Current output schema:
+  time_utc,wse,slope,width,reach_q,wse_units,slope_units,width_units,consensus_q
 """
 
 import os
@@ -54,24 +35,30 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.models import Variable
 
+
 # -----------------------------------------------------------------------------
 # Airflow logging
 # -----------------------------------------------------------------------------
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+
 # -----------------------------------------------------------------------------
-# Defaults (can be overridden by Airflow Variables)
+# Defaults
 # -----------------------------------------------------------------------------
 DEFAULT_GEOJSON_URL = (
-    "https://ihp-wins.unesco.org/dataset/a3d41691-c16c-4f82-ad83-d12fb38df910/"
-    "resource/6a2426b1-4c65-4dab-bf32-b252aa206adc/download/dnipro_sword_reaches_clip.geojson"
+    "https://ihp-wins.unesco.org/dataset/811c5aef-99e8-46e8-a708-12972138b70d/"
+    "resource/e5982971-3e89-4f81-a9e3-67333e168e17/download/"
+    "dnipro_sword_reaches_clip_with_discharge.geojson"
 )
+
 DEFAULT_REACH_ID_FIELD = "reach_id"
 
 DEFAULT_HYDROCRON_URL = "https://soto.podaac.earthdatacloud.nasa.gov/hydrocron/v1/timeseries"
 DEFAULT_COLLECTION_NAME = "SWOT_L2_HR_RiverSP_D"
-DEFAULT_FIELDS = "reach_id,time_str,cycle_id,pass_id,wse,slope,width,dschg_gm,dschg_gm_q,reach_q"
+
+# Only request the fields you actually want to retain in the CSV
+DEFAULT_FIELDS = "time_str,wse,slope,width,reach_q"
 
 DEFAULT_TIMEOUT_S = 60
 DEFAULT_SLEEP_MIN_S = 0.2
@@ -82,17 +69,30 @@ DEFAULT_OVERLAP_HOURS = 48
 DEFAULT_BACKFILL_DAYS_IF_EMPTY = 2
 
 DEFAULT_AZURE_CONTAINER = "data"
-DEFAULT_AZURE_PREFIX = "SWOT/hydrocron_timeseries_by_reach"  # no trailing slash
+DEFAULT_AZURE_PREFIX = "SWOT/SWOT_dnipro_reach_hydrocron_DAWG"  # no trailing slash
+
+# Sentinel masking threshold for Hydrocron-style fill values
+# Covers values like -999999999, -9e9, etc.
+DEFAULT_FILL_VALUE_THRESHOLD = -1e9
+
+# Final column order expected in Azure CSVs
+FINAL_COLUMNS = [
+    "time_utc",
+    "wse",
+    "slope",
+    "width",
+    "reach_q",
+    "wse_units",
+    "slope_units",
+    "width_units",
+    "consensus_q",
+]
+
 
 # -----------------------------------------------------------------------------
 # Helper: read Airflow Variable with fallback
 # -----------------------------------------------------------------------------
 def vget(key: str, default: Any) -> Any:
-    """
-    Airflow Variable getter with fallback.
-    - If Variable doesn't exist, returns default.
-    - If exists but empty, returns default.
-    """
     try:
         val = Variable.get(key)
         if val is None:
@@ -105,16 +105,18 @@ def vget(key: str, default: Any) -> Any:
 
 
 # -----------------------------------------------------------------------------
-# Core HTTP + parsing helpers
+# HTTP + parsing helpers
 # -----------------------------------------------------------------------------
-def request_with_retries(url: str, params: Optional[Dict[str, Any]] = None,
-                         timeout_s: int = DEFAULT_TIMEOUT_S,
-                         max_retries: int = DEFAULT_MAX_RETRIES) -> requests.Response:
+def request_with_retries(
+    url: str,
+    params: Optional[Dict[str, Any]] = None,
+    timeout_s: int = DEFAULT_TIMEOUT_S,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+) -> requests.Response:
     last_err = None
     for attempt in range(1, max_retries + 1):
         try:
             r = requests.get(url, params=params or {}, timeout=timeout_s)
-            # transient-ish response codes that are worth retrying
             if r.status_code in (429, 500, 502, 503, 504):
                 raise RuntimeError(f"HTTP {r.status_code}")
             return r
@@ -128,9 +130,8 @@ def request_with_retries(url: str, params: Optional[Dict[str, Any]] = None,
 def hydrocron_response_to_df(text: str) -> pd.DataFrame:
     """
     Hydrocron can return:
-      - plain CSV text (when output=csv)
+      - plain CSV text
       - JSON payload containing results.csv
-    This safely handles both.
     """
     text = (text or "").strip()
     if not text:
@@ -141,9 +142,11 @@ def hydrocron_response_to_df(text: str) -> pd.DataFrame:
             obj = json.loads(text)
         except json.JSONDecodeError:
             return pd.DataFrame()
+
         csv_text = (obj.get("results", {}).get("csv", "") or "").strip()
         if not csv_text:
             return pd.DataFrame()
+
         try:
             return pd.read_csv(io.StringIO(csv_text))
         except EmptyDataError:
@@ -167,27 +170,30 @@ def safe_read_csv_text(text: Optional[str]) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def load_reach_ids_from_geojson(url: str, field: str,
-                                timeout_s: int,
-                                max_retries: int) -> List[str]:
+def load_reach_ids_from_geojson(
+    url: str,
+    field: str,
+    timeout_s: int,
+    max_retries: int,
+) -> List[str]:
     r = request_with_retries(url, timeout_s=timeout_s, max_retries=max_retries)
+    r.raise_for_status()
     obj = r.json()
 
     feats = obj.get("features", []) or []
     out: List[str] = []
+
     for f in feats:
         props = f.get("properties", {}) or {}
         val = props.get(field, None)
         if val is None:
             continue
         s = str(val).strip()
-        # normalize integers that got serialized as float-looking strings (e.g., "22511300021.0")
         if s.endswith(".0"):
             s = s[:-2]
         if s:
             out.append(s)
 
-    # unique, stable order
     seen = set()
     uniq: List[str] = []
     for rid in out:
@@ -202,10 +208,18 @@ def load_reach_ids_from_geojson(url: str, field: str,
 
 
 def get_last_time_dt(existing: pd.DataFrame) -> Optional[datetime]:
-    if existing is None or existing.empty or "time_str" not in existing.columns:
+    if existing is None or existing.empty:
         return None
 
-    s = existing["time_str"].astype(str).str.strip()
+    time_col = None
+    if "time_utc" in existing.columns:
+        time_col = "time_utc"
+    elif "time_str" in existing.columns:
+        time_col = "time_str"
+    else:
+        return None
+
+    s = existing[time_col].astype(str).str.strip()
     s = s[(s != "") & (s.str.lower() != "nan") & (s != "no_data")]
     if len(s) == 0:
         return None
@@ -217,27 +231,101 @@ def get_last_time_dt(existing: pd.DataFrame) -> Optional[datetime]:
 
     if ts.notna().any():
         return ts.max().to_pydatetime()
+
     return None
 
 
-def clean_new_df(df: pd.DataFrame, rid: str) -> pd.DataFrame:
+def mask_fill_values(df: pd.DataFrame, fill_threshold: float) -> pd.DataFrame:
+    """
+    Replace very large negative sentinel values with NA.
+    This is applied only to numeric data columns.
+    """
     if df is None or df.empty:
-        return pd.DataFrame()
+        return df
 
     df = df.copy()
 
-    if "reach_id" not in df.columns:
-        df["reach_id"] = rid
+    numeric_cols = ["wse", "slope", "width", "reach_q", "consensus_q"]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+            df.loc[df[col] <= fill_threshold, col] = pd.NA
 
+    return df
+
+
+def standardize_output_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Force output columns and order to:
+    time_utc,wse,slope,width,reach_q,wse_units,slope_units,width_units,consensus_q
+    """
+    if df is None:
+        df = pd.DataFrame()
+
+    df = df.copy()
+
+    # Rename Hydrocron time column to current saved schema
+    if "time_str" in df.columns and "time_utc" not in df.columns:
+        df = df.rename(columns={"time_str": "time_utc"})
+
+    # Add required columns if missing
+    if "wse_units" not in df.columns:
+        df["wse_units"] = "m"
+    if "slope_units" not in df.columns:
+        df["slope_units"] = "m/m"
+    if "width_units" not in df.columns:
+        df["width_units"] = "m"
+    if "consensus_q" not in df.columns:
+        df["consensus_q"] = pd.NA
+
+    # Ensure all final columns exist
+    for col in FINAL_COLUMNS:
+        if col not in df.columns:
+            df[col] = pd.NA
+
+    df = df[FINAL_COLUMNS]
+    return df
+
+
+def clean_new_df(df: pd.DataFrame, fill_threshold: float) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=FINAL_COLUMNS)
+
+    df = df.copy()
+
+    # Remove Hydrocron no_data rows and normalize time column
     if "time_str" in df.columns:
-        df = df[df["time_str"] != "no_data"]
+        df = df[df["time_str"].astype(str).str.strip() != "no_data"].copy()
         t = pd.to_datetime(df["time_str"], errors="coerce", utc=True)
         df = df.loc[t.notna()].copy()
         df["time_str"] = t.loc[t.notna()].dt.strftime("%Y-%m-%dT%H:%M:%SZ").values
 
-    if "wse" in df.columns:
-        # filter Hydrocron fill values
-        df = df[df["wse"] > -1e11]
+    # Mask fill values
+    df = mask_fill_values(df, fill_threshold=fill_threshold)
+
+    # Standardize to final saved schema
+    df = standardize_output_schema(df)
+
+    # Drop rows where all actual data vars are NA
+    data_cols = ["wse", "slope", "width", "reach_q", "consensus_q"]
+    keep_mask = df[data_cols].notna().any(axis=1)
+    df = df.loc[keep_mask].copy()
+
+    return df.reset_index(drop=True)
+
+
+def clean_existing_df(df: pd.DataFrame, fill_threshold: float) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=FINAL_COLUMNS)
+
+    df = df.copy()
+    df = mask_fill_values(df, fill_threshold=fill_threshold)
+    df = standardize_output_schema(df)
+
+    if "time_utc" in df.columns:
+        t = pd.to_datetime(df["time_utc"], errors="coerce", utc=True)
+        df = df.loc[t.notna()].copy()
+        df["time_utc"] = t.loc[t.notna()].dt.strftime("%Y-%m-%dT%H:%M:%SZ").values
 
     return df.reset_index(drop=True)
 
@@ -250,10 +338,12 @@ def append_dedup(existing: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
     else:
         out = pd.concat([existing, new], ignore_index=True, sort=False)
 
-    if "time_str" in out.columns:
-        out["time_str"] = out["time_str"].astype(str)
-        out = out.drop_duplicates(subset=["time_str"], keep="last")
-        out = out.sort_values("time_str")
+    out = standardize_output_schema(out)
+
+    if "time_utc" in out.columns:
+        out["time_utc"] = out["time_utc"].astype(str)
+        out = out.drop_duplicates(subset=["time_utc"], keep="last")
+        out = out.sort_values("time_utc")
 
     return out.reset_index(drop=True)
 
@@ -288,12 +378,6 @@ def upload_blob_text(container: ContainerClient, blob_name: str, text: str) -> N
 # Main callable for Airflow
 # -----------------------------------------------------------------------------
 def run_swot_hydrocron_incremental_update(**context) -> Dict[str, Any]:
-    """
-    Airflow task entrypoint.
-    Returns a small dict summary (visible in task logs / XCom if enabled).
-    """
-
-    # --- Load config (Airflow Variables override defaults) ---
     geojson_url = vget("SWOT_GEOJSON_URL", DEFAULT_GEOJSON_URL)
     reach_id_field = vget("SWOT_REACH_ID_FIELD", DEFAULT_REACH_ID_FIELD)
 
@@ -313,15 +397,20 @@ def run_swot_hydrocron_incremental_update(**context) -> Dict[str, Any]:
     azure_prefix = vget("SWOT_AZURE_PREFIX", DEFAULT_AZURE_PREFIX).rstrip("/")
     azure_log_blob = f"{azure_prefix}/update_log_daily.csv"
 
-    # connection string: prefer Airflow Variable, then environment variable
-    conn_str = vget("AZURE_STORAGE_CONNECTION_STRING", os.environ.get("AZURE_STORAGE_CONNECTION_STRING", "")).strip()
+    fill_threshold = float(vget("SWOT_FILL_VALUE_THRESHOLD", DEFAULT_FILL_VALUE_THRESHOLD))
+
+    conn_str = vget(
+        "AZURE_STORAGE_CONNECTION_STRING",
+        os.environ.get("AZURE_STORAGE_CONNECTION_STRING", "")
+    ).strip()
+
     if not conn_str:
         raise RuntimeError(
-            "Missing Azure connection string. Set Airflow Variable 'AZURE_STORAGE_CONNECTION_STRING' "
-            "or environment variable AZURE_STORAGE_CONNECTION_STRING."
+            "Missing Azure connection string. Set Airflow Variable "
+            "'AZURE_STORAGE_CONNECTION_STRING' or environment variable "
+            "AZURE_STORAGE_CONNECTION_STRING."
         )
 
-    # --- Run window ---
     end_dt = datetime.now(timezone.utc)
     end_iso = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -330,6 +419,7 @@ def run_swot_hydrocron_incremental_update(**context) -> Dict[str, Any]:
     logger.info("GeoJSON: %s", geojson_url)
     logger.info("Azure container: %s", azure_container_name)
     logger.info("Azure prefix: %s", azure_prefix)
+    logger.info("Fill threshold: %s", fill_threshold)
 
     reach_ids = load_reach_ids_from_geojson(
         geojson_url,
@@ -351,7 +441,10 @@ def run_swot_hydrocron_incremental_update(**context) -> Dict[str, Any]:
 
         try:
             existing_text = download_blob_text(container, blob)
-            existing_df = safe_read_csv_text(existing_text)
+            existing_df = clean_existing_df(
+                safe_read_csv_text(existing_text),
+                fill_threshold=fill_threshold,
+            )
 
             last_dt = get_last_time_dt(existing_df)
             if last_dt is not None:
@@ -380,7 +473,6 @@ def run_swot_hydrocron_incremental_update(**context) -> Dict[str, Any]:
                 max_retries=max_retries,
             )
 
-            # Don’t kill full run on a single bad reach
             if r.status_code == 400:
                 msg = (r.text or "").strip()[:250]
                 no_change_count += 1
@@ -397,7 +489,10 @@ def run_swot_hydrocron_incremental_update(**context) -> Dict[str, Any]:
 
             r.raise_for_status()
 
-            new_df = clean_new_df(hydrocron_response_to_df(r.text), rid)
+            new_df = clean_new_df(
+                hydrocron_response_to_df(r.text),
+                fill_threshold=fill_threshold,
+            )
 
             if new_df.empty:
                 no_change_count += 1
@@ -412,10 +507,14 @@ def run_swot_hydrocron_incremental_update(**context) -> Dict[str, Any]:
                 logger.info("[%d/%d] %s no change (0 rows)", i, len(reach_ids), rid)
                 continue
 
-            # timestamp-based “truly new” check
-            if (not existing_df.empty) and ("time_str" in existing_df.columns) and ("time_str" in new_df.columns):
-                existing_times = set(existing_df["time_str"].astype(str).tolist())
-                incoming_times = set(new_df["time_str"].astype(str).tolist())
+            if (
+                not existing_df.empty
+                and "time_utc" in existing_df.columns
+                and "time_utc" in new_df.columns
+            ):
+                existing_times = set(existing_df["time_utc"].astype(str).tolist())
+                incoming_times = set(new_df["time_utc"].astype(str).tolist())
+
                 if len(incoming_times - existing_times) == 0:
                     no_change_count += 1
                     log_rows.append({
@@ -426,7 +525,10 @@ def run_swot_hydrocron_incremental_update(**context) -> Dict[str, Any]:
                         "new_rows": 0,
                         "total_rows": len(existing_df),
                     })
-                    logger.info("[%d/%d] %s no change (timestamps already present)", i, len(reach_ids), rid)
+                    logger.info(
+                        "[%d/%d] %s no change (timestamps already present)",
+                        i, len(reach_ids), rid
+                    )
                     continue
 
             out_df = append_dedup(existing_df, new_df)
@@ -444,7 +546,10 @@ def run_swot_hydrocron_incremental_update(**context) -> Dict[str, Any]:
                 "new_rows": len(new_df),
                 "total_rows": len(out_df),
             })
-            logger.info("[%d/%d] %s appended new=%d total=%d", i, len(reach_ids), rid, len(new_df), len(out_df))
+            logger.info(
+                "[%d/%d] %s appended new=%d total=%d",
+                i, len(reach_ids), rid, len(new_df), len(out_df)
+            )
 
         except Exception as e:
             error_count += 1
@@ -458,11 +563,13 @@ def run_swot_hydrocron_incremental_update(**context) -> Dict[str, Any]:
             })
             logger.exception("[%d/%d] %s ERROR", i, len(reach_ids), rid)
 
-    # Upload run log to Azure
     log_df = pd.DataFrame(log_rows)
     upload_blob_text(container, azure_log_blob, log_df.to_csv(index=False))
 
-    logger.info("SUMMARY appended=%d no_change=%d errors=%d", appended_count, no_change_count, error_count)
+    logger.info(
+        "SUMMARY appended=%d no_change=%d errors=%d",
+        appended_count, no_change_count, error_count
+    )
     logger.info("Log uploaded: %s", azure_log_blob)
 
     return {
@@ -481,7 +588,6 @@ def run_swot_hydrocron_incremental_update(**context) -> Dict[str, Any]:
 default_args = {
     "owner": "airflow",
     "depends_on_past": False,
-    # pick a start_date that makes sense for your deployment; no catchup anyway
     "start_date": datetime(2026, 2, 26),
     "retries": 1,
     "retry_delay": timedelta(minutes=10),
@@ -491,7 +597,7 @@ with DAG(
     dag_id="swot_hydrocron_incremental_update",
     default_args=default_args,
     description="Daily incremental update of SWOT RiverSP per-reach Hydrocron time series to Azure Blob",
-    schedule_interval="0 8 * * *",  # daily 08:00 UTC (adjust as needed)
+    schedule_interval="0 8 * * *",
     catchup=False,
     max_active_runs=1,
     tags=["swot", "hydrocron", "azure", "unesco"],
