@@ -22,8 +22,8 @@ import json
 import logging
 import os
 import random
+import re
 import shutil
-import stat
 import tempfile
 import time
 from datetime import datetime, timedelta, timezone
@@ -79,19 +79,20 @@ DEFAULT_MAX_RETRIES = 5
 DEFAULT_OVERLAP_HOURS = 48
 DEFAULT_BACKFILL_DAYS_IF_EMPTY = 2
 
+TIMESTAMP_RE = re.compile(r"(\d{8}T\d{6})")
+
 
 def vget(key: str, default: Any) -> Any:
     env_val = os.environ.get(key)
     if env_val is not None and str(env_val).strip() != "":
         return env_val
 
-    if Variable is not None:
-        try:
-            val = Variable.get(key)
-            if val is not None and str(val).strip() != "":
-                return val
-        except Exception:
-            pass
+    try:
+        val = Variable.get(key)
+        if val is not None and str(val).strip() != "":
+            return val
+    except Exception:
+        pass
 
     return default
 
@@ -146,10 +147,6 @@ def request_with_retries(
     raise RuntimeError(f"Failed after {max_retries} retries. Last error: {last_err}")
 
 
-# DAWG detection/download/upload helpers adapted from weekly_update_dawg_latest_to_azure.ipynb.
-TIMESTAMP_RE = __import__("re").compile(r"(\d{8}T\d{6})")
-
-
 def sort_key_from_filename(name: str) -> Tuple[str, ...]:
     return tuple(TIMESTAMP_RE.findall(name))
 
@@ -195,25 +192,45 @@ def get_current_azure_latest_filename(container: ContainerClient, prefix: str) -
     return sorted(basenames, key=sort_key_from_filename)[-1]
 
 
-def create_runtime_netrc(nasa_username: str, nasa_password: str) -> Path:
-    home = Path.home()
-    netrc_path = home / ".netrc"
-    contents = (
-        "machine urs.earthdata.nasa.gov\n"
-        f"login {nasa_username}\n"
-        f"password {nasa_password}\n"
-    )
-    netrc_path.write_text(contents, encoding="utf-8")
+# -------------------------------------------------------------------
+# EARTHACCESS AUTH: rewritten to match your working Airflow example
+# -------------------------------------------------------------------
+def setup_netrc() -> str:
+    """
+    Create or overwrite ~/.netrc using Airflow Variables first, then env vars.
+    Matches the working Airflow pattern you showed.
+    """
     try:
-        os.chmod(netrc_path, stat.S_IRUSR | stat.S_IWUSR)
+        username = Variable.get("NASA_USERNAME")
     except Exception:
-        logger.warning("Could not tighten permissions on %s; continuing.", netrc_path)
+        username = os.environ.get("NASA_USERNAME", "")
+
+    try:
+        password = Variable.get("NASA_PASSWORD")
+    except Exception:
+        password = os.environ.get("NASA_PASSWORD", "")
+
+    username = require_value("NASA_USERNAME", username)
+    password = require_value("NASA_PASSWORD", password)
+
+    netrc_path = os.path.expanduser("~/.netrc")
+    with open(netrc_path, "w", encoding="utf-8") as f:
+        f.write(
+            f"""machine urs.earthdata.nasa.gov
+    login {username}
+    password {password}
+"""
+        )
+
+    os.chmod(netrc_path, 0o600)
+    print(f".netrc creado en {netrc_path}", flush=True)
+    logger.info(".netrc creado en %s", netrc_path)
     return netrc_path
 
 
-def earthaccess_login_airflow_style(nasa_username: str, nasa_password: str) -> Path:
-    log_step("STEP 1: creating runtime .netrc")
-    netrc_path = create_runtime_netrc(nasa_username, nasa_password)
+def earthaccess_login() -> str:
+    log_step("STEP 1: creating .netrc for Earthaccess")
+    netrc_path = setup_netrc()
     log_step(f"STEP 1 DONE: .netrc created at {netrc_path}")
 
     log_step("STEP 2: logging into Earthaccess via netrc")
@@ -225,6 +242,7 @@ def earthaccess_login_airflow_style(nasa_username: str, nasa_password: str) -> P
 def get_latest_matching_earthaccess_granule(short_name: str, region_prefix: str):
     log_step(f"STEP 3: searching Earthaccess short_name={short_name} region_prefix={region_prefix}")
     granules = earthaccess.search_data(short_name=short_name, count=500)
+
     eu_granules = []
     for granule in granules:
         native_id = granule["meta"].get("native-id")
@@ -240,6 +258,7 @@ def get_latest_matching_earthaccess_granule(short_name: str, region_prefix: str)
         eu_granules,
         key=lambda x: sort_key_from_filename(x[0]),
     )[-1]
+
     log_step(f"STEP 3 DONE: latest Earthaccess native-id={latest_name}")
     return latest_name, latest_granule
 
@@ -256,17 +275,21 @@ def download_granule_to_local(granule, local_tmp_dir: Path) -> Path:
     local_tmp_dir.mkdir(parents=True, exist_ok=True)
     log_step(f"STEP 4: starting DAWG download into {local_tmp_dir}")
     log_disk_usage(local_tmp_dir, "BEFORE DOWNLOAD")
+
     paths = earthaccess.download([granule], local_path=str(local_tmp_dir))
     if not paths:
         raise RuntimeError("earthaccess.download returned no files.")
+
     local_path = Path(paths[0])
     log_step(f"STEP 4 DONE: DAWG download completed: {local_path}")
     log_disk_usage(local_tmp_dir, "AFTER DOWNLOAD")
+
     try:
         size_gb = local_path.stat().st_size / 1e9
         log_step(f"Downloaded file size_gb={size_gb:.2f}")
     except Exception:
         pass
+
     return local_path
 
 
@@ -297,7 +320,6 @@ def delete_other_nc_blobs_in_prefix(
     return deleted
 
 
-# CSV update helpers adapted from context/riverSP_DAWG_append.ipynb.
 def safe_read_csv_text(text: Optional[str]) -> pd.DataFrame:
     if text is None or str(text).strip() == "":
         return pd.DataFrame()
@@ -421,7 +443,6 @@ def update_existing_csv_consensus_q(existing_df: pd.DataFrame, dawg_df: pd.DataF
         return out_df[original_columns].reset_index(drop=True)
 
     dawg_indexed = dawg_df.drop_duplicates(subset=["time_utc"], keep="last").set_index("time_utc")
-    out_df = out_df.copy()
     out_df["time_utc"] = out_df["time_utc"].astype(str)
 
     existing_mask = out_df["time_utc"].isin(dawg_indexed.index)
@@ -429,7 +450,9 @@ def update_existing_csv_consensus_q(existing_df: pd.DataFrame, dawg_df: pd.DataF
         matched_values = dawg_indexed.loc[out_df.loc[existing_mask, "time_utc"], "consensus_q"].to_numpy()
         out_df.loc[existing_mask, "consensus_q"] = matched_values
 
-    new_times = [t for t in dawg_indexed.index.tolist() if t not in set(out_df["time_utc"].tolist())]
+    existing_time_set = set(out_df["time_utc"].tolist())
+    new_times = [t for t in dawg_indexed.index.tolist() if t not in existing_time_set]
+
     if new_times:
         new_rows = pd.DataFrame(columns=original_columns)
         for column in original_columns:
@@ -439,8 +462,10 @@ def update_existing_csv_consensus_q(existing_df: pd.DataFrame, dawg_df: pd.DataF
                 new_rows[column] = dawg_indexed.loc[new_times, "consensus_q"].to_numpy()
             else:
                 new_rows[column] = pd.NA
+
         if "reach_id" in new_rows.columns and "reach_id" in out_df.columns and not out_df["reach_id"].dropna().empty:
             new_rows["reach_id"] = out_df["reach_id"].dropna().iloc[0]
+
         out_df = pd.concat([out_df, new_rows], ignore_index=True, sort=False)
 
     out_df = out_df.drop_duplicates(subset=["time_utc"], keep="last")
@@ -475,7 +500,6 @@ def load_reach_ids_from_geojson(
     return reach_ids
 
 
-# GeoJSON update helpers adapted from context/update_dnipro_discharge_availability.ipynb.
 def build_public_csv_url(public_csv_base_url: str, rid: str) -> str:
     return f"{public_csv_base_url.rstrip('/')}/reach_{safe_reach_filename(rid)}.csv"
 
@@ -674,6 +698,7 @@ def update_reach_csvs(
                     start_dt,
                     run_end_dt,
                 )
+
                 if dawg_new.empty:
                     no_change_count += 1
                     logger.info("[%d/%d] %s no DAWG rows in window", i, len(reach_ids), rid)
@@ -754,6 +779,7 @@ def update_geojson_resource(
         timeout_s=timeout_s,
     )
     response.raise_for_status()
+
     payload = response.json()
     if not payload.get("success"):
         raise RuntimeError(json.dumps(payload, ensure_ascii=False))
@@ -775,8 +801,6 @@ def run_weekly_dawg_csv_geojson_update() -> Dict[str, Any]:
         "CKAN_API_KEY",
         vget("CKAN_API_KEY", vget("IHP_WINS_CKAN_API_KEY", "")),
     )
-    nasa_username = require_value("NASA_USERNAME", vget("NASA_USERNAME", ""))
-    nasa_password = require_value("NASA_PASSWORD", vget("NASA_PASSWORD", ""))
 
     azure_container_name = vget("SWOT_AZURE_CONTAINER", DEFAULT_AZURE_CONTAINER)
     azure_dawg_blob_prefix = vget("SWOT_DAWG_BLOB_PREFIX", DEFAULT_AZURE_DAWG_BLOB_PREFIX).rstrip("/")
@@ -811,7 +835,7 @@ def run_weekly_dawg_csv_geojson_update() -> Dict[str, Any]:
     log_disk_usage(runtime_temp_dir, "INITIAL")
     log_step("Config and runtime environment loaded successfully")
 
-    earthaccess_login_airflow_style(nasa_username, nasa_password)
+    earthaccess_login()
 
     log_step("STEP 0: connecting to Azure container")
     container = get_container(azure_storage_connection_string, azure_container_name)
