@@ -1,5 +1,6 @@
 import requests
 import json
+import logging
 from collections import defaultdict, Counter
 import xml.etree.ElementTree as ET
 import urllib.parse
@@ -10,6 +11,8 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.models import Variable
 from datetime import datetime, timedelta
+
+logger = logging.getLogger(__name__)
 
 # ------------------------------
 # Configurations
@@ -43,22 +46,26 @@ APIdev = Variable.get("APIDEV")
 # Functions
 # ------------------------------
 
-def get_api_data(url):
+def get_api_data(url, method="GET", json_body=None):
     """
-    Performs a GET request to the given URL with retry logic and timeout.
+    Performs an HTTP request to the given URL with retry logic and timeout.
+    Supports both GET and POST methods for CKAN API compatibility.
     """
     try:
-        response = http.get(url, timeout=TIMEOUT_SECONDS)
+        if method.upper() == "POST":
+            response = http.post(url, json=json_body or {}, timeout=TIMEOUT_SECONDS)
+        else:
+            response = http.get(url, timeout=TIMEOUT_SECONDS)
         if response.status_code == 200:
             return response.json()
         else:
-            print(f"Error in request to {url}: {response.status_code}")
+            logger.error(f"Error in request to {url}: {response.status_code} - {response.text[:200]}")
             return None
     except requests.exceptions.Timeout:
-        print(f"Request to {url} timed out after {TIMEOUT_SECONDS} seconds")
+        logger.error(f"Request to {url} timed out after {TIMEOUT_SECONDS} seconds")
         return None
     except Exception as e:
-        print(f"Exception during request to {url}: {e}")
+        logger.error(f"Exception during request to {url}: {e}")
         return None
 
 def process_sld_styles(style_url, resource_format):
@@ -779,12 +786,16 @@ def upload_ckan(file_path, entity_name=None, entity_type='organization'):
     """
     headers = {"Authorization": APIdev}
 
-    # Get the ID of the package
+    # Get the ID of the package (use POST for CKAN 2.10+ compatibility)
     package_show_url = f"{ckan_api_url}package_show"
-    params = {"id": "terriajs-map-catalog-in-json-format"}
 
     try:
-        response = requests.get(package_show_url, params=params, headers=headers, timeout=TIMEOUT_SECONDS)
+        response = requests.post(
+            package_show_url,
+            json={"id": "terriajs-map-catalog-in-json-format"},
+            headers=headers,
+            timeout=TIMEOUT_SECONDS
+        )
         if response.status_code == 200:
             package_data = response.json()
             package_id = package_data['result']['id']
@@ -841,15 +852,17 @@ def upload_ckan(file_path, entity_name=None, entity_type='organization'):
                 create_url = f"{ckan_api_url}resource_create"
                 response = requests.post(create_url, headers=headers, data=data_dict, files=files, timeout=TIMEOUT_SECONDS)
 
-            print(f"Status Code: {response.status_code}")
-            print(f"Response: {response.json()}")
+            logger.info(f"Upload {final_name}: Status={response.status_code}")
+            resp_data = response.json()
+            if not resp_data.get('success'):
+                logger.error(f"Upload failed for {final_name}: {resp_data.get('error', resp_data)}")
 
         else:
-            print(f"Failed to retrieve package: {response.status_code}")
+            logger.error(f"Failed to retrieve package for upload: {response.status_code} - {response.text[:200]}")
     except requests.exceptions.Timeout:
-        print(f"Upload to CKAN timed out after {TIMEOUT_SECONDS} seconds")
+        logger.error(f"Upload to CKAN timed out after {TIMEOUT_SECONDS} seconds for {file_path}")
     except Exception as e:
-        print(f"Error in upload_ckan: {e}")
+        logger.error(f"Error in upload_ckan for {file_path}: {e}")
 
 def generate_and_upload_catalog():
     # 1. Obtain package IDs from the organization
@@ -859,23 +872,28 @@ def generate_and_upload_catalog():
     if package_list_data and 'result' in package_list_data:
         package_ids = package_list_data['result']
     else:
-        print("Failed to obtain package IDs.")
-        return  # exit the function
+        raise RuntimeError("Failed to obtain package IDs from CKAN API.")
+
+    logger.info(f"Found {len(package_ids)} packages to process")
 
     # Create data structures for grouping
     datasets_by_org = defaultdict(lambda: defaultdict(list))
     org_info_cache = {}
+    processed_count = 0
+    skipped_count = 0
 
     # Main loop to process resources
     for package_id in package_ids:
-        package_url = f"{base_url}package_show?id={package_id}"
-        package_data = get_api_data(package_url)
+        package_show_url = f"{base_url}package_show"
+        package_data = get_api_data(package_show_url, method="POST", json_body={"id": package_id})
 
         if not package_data or 'result' not in package_data:
+            skipped_count += 1
             continue
 
         org = package_data['result'].get('organization')
         if not org:
+            skipped_count += 1
             continue
         org_name = org.get('title', 'No Organization')
         org_id = org.get('name')
@@ -913,6 +931,12 @@ def generate_and_upload_catalog():
                         formatted_item, _ = format_dataset_item(resource, package_id, notes, org_info, view_index)
                         datasets_by_org[org_name][dataset_title].append(formatted_item)
                         view_index += 1
+
+        processed_count += 1
+
+    logger.info(f"Processed {processed_count} packages, skipped {skipped_count}")
+    if processed_count == 0:
+        raise RuntimeError(f"No packages were processed successfully out of {len(package_ids)}. Check CKAN API connectivity.")
 
     # Create the final catalog structure
     catalog = {
@@ -979,12 +1003,12 @@ def generate_and_upload_catalog():
         # Save and upload individual organization file
         org_filename = f"catalog_{org_name.lower().replace(' ', '_')}.json"
         write_catalog_file(convert_sets_to_lists(org_catalog), org_filename, entity_name=org_name, entity_type='organization')
-        print(f"Catalog for {org_name} saved to: {org_filename}")
+        logger.info(f"Catalog for {org_name} saved to: {org_filename}")
         upload_ckan(org_filename, entity_name=org_name, entity_type='organization')
 
     # Save and upload consolidated file
     write_catalog_file(convert_sets_to_lists({"catalog": catalog["catalog"]}), "IHP-WINS.json")
-    print("Consolidated catalog saved to: IHP-WINS.json")
+    logger.info(f"Consolidated catalog saved to: IHP-WINS.json with {len(catalog['catalog'])} organizations")
     upload_ckan("IHP-WINS.json")
 
 def generate_and_upload_catalog_by_tag():
@@ -994,8 +1018,9 @@ def generate_and_upload_catalog_by_tag():
     if tag_list_data and 'result' in tag_list_data:
         tag_names = tag_list_data['result']
     else:
-        print("Failed to obtain tag list.")
-        return
+        raise RuntimeError("Failed to obtain tag list from CKAN API.")
+
+    logger.info(f"Found {len(tag_names)} tags to process")
 
     # Create data structures for grouping
     datasets_by_tag = defaultdict(lambda: defaultdict(list))
@@ -1077,10 +1102,10 @@ def generate_and_upload_catalog_by_tag():
         # Save and upload individual tag catalog
         tag_filename = f"tag_{tag_name.lower().replace(' ', '_')}.json"
         write_catalog_file(convert_sets_to_lists(tag_catalog), tag_filename)
-        print(f"Catalog for tag {tag_name} saved to: {tag_filename}")
+        logger.info(f"Catalog for tag {tag_name} saved to: {tag_filename}")
         upload_ckan(tag_filename, entity_name=tag_name, entity_type='tag')
 
-    print("Consolidated catalog by tags saved to: Skipped")
+    logger.info(f"Catalog by tags complete: {len(datasets_by_tag)} tags processed")
 
 # ------------------------------
 # Airflow DAG Configuration
