@@ -4,12 +4,18 @@ from airflow.models import Variable
 
 import requests
 import json
+import logging
 import pandas as pd
 from time import sleep
 import re
 from datetime import datetime, timedelta
 import pytz
 from collections import defaultdict
+
+logger = logging.getLogger(__name__)
+
+WAMIS_TIMEOUT = 30
+CKAN_TIMEOUT = 120
 
 # API URLs
 urlPatch = Variable.get("urlPatch")
@@ -96,11 +102,11 @@ default_args = {
 # Function to get stations list
 def get_stations(urlstation = STATIONS_URL):
     params = {"output": "json"}
-    response = requests.get(urlstation, params=params)
+    response = requests.get(urlstation, params=params, timeout=WAMIS_TIMEOUT)
     if response.status_code == 200:
         return response.json()
     else:
-        print("Error fetching stations:", response.status_code)
+        logger.error(f"Error fetching stations from {urlstation}: {response.status_code}")
         return None
 
 # Write each group of stations into a separate JSON file
@@ -122,59 +128,59 @@ def save_stations_by_group(stations):
         # Store the filename in the output dictionary
         output_files[mngorg] = filename
     
-    print("Station groups saved in the following files:", output_files)
+    logger.info("Station groups saved in the following files:", output_files)
     return output_files
 
 # Function to get station info
 def get_station_info(station_code, stationInfoUrl = STATION_INFO_URL):
     params = {"obscd": station_code, "output": "json"}
-    response = requests.get(stationInfoUrl, params=params)
+    response = requests.get(stationInfoUrl, params=params, timeout=WAMIS_TIMEOUT)
     if response.status_code == 200:
         return response.json()
     else:
-        print(f"Error fetching station info for {station_code}:", response.status_code)
+        logger.error(f"Error fetching station info for {station_code}: {response.status_code}")
         return None
 
 # Function to get hourly precipitation data
 def get_hourly_precipitation(station_code, start_date, end_date):
     params = {"obscd": station_code, "startdt": start_date, "enddt": end_date, "output": "json"}
-    response = requests.get(HOURLY_PRECIPITATION_URL, params=params)
+    response = requests.get(HOURLY_PRECIPITATION_URL, params=params, timeout=WAMIS_TIMEOUT)
     return response.json() if response.status_code == 200 else 'ERROR'
 
 # Function to get daily precipitation data
 def get_daily_precipitation(station_code, start_date, end_date):
     params = {"obscd": station_code, "startdt": start_date, "enddt": end_date, "output": "json"}
-    response = requests.get(DAILY_PRECIPITATION_URL, params=params)
+    response = requests.get(DAILY_PRECIPITATION_URL, params=params, timeout=WAMIS_TIMEOUT)
     return response.json() if response.status_code == 200 else 'ERROR'
 
 # Function to get monthly precipitation data
 def get_monthly_precipitation(station_code, start_date, end_date):
     params = {"obscd": station_code, "startdt": start_date, "enddt": end_date, "output": "json"}
-    response = requests.get(MONTHLY_PRECIPITATION_URL, params=params)
+    response = requests.get(MONTHLY_PRECIPITATION_URL, params=params, timeout=WAMIS_TIMEOUT)
     return response.json() if response.status_code == 200 else 'ERROR'
 
 # Function to get hourly water level data
 def get_hourly_water_level(station_code, start_date, end_date):
     params = {"obscd": station_code, "startdt": start_date, "enddt": end_date, "output": "json"}
-    response = requests.get(HOURLY_WL_URL, params=params)
+    response = requests.get(HOURLY_WL_URL, params=params, timeout=WAMIS_TIMEOUT)
     return response.json() if response.status_code == 200 else 'ERROR'
 
 # Function to get daily water level data
 def get_daily_water_level(station_code, start_date, end_date):
     params = {"obscd": station_code, "startdt": start_date, "enddt": end_date, "output": "json"}
-    response = requests.get(DAILY_WL_URL, params=params)
+    response = requests.get(DAILY_WL_URL, params=params, timeout=WAMIS_TIMEOUT)
     return response.json() if response.status_code == 200 else 'ERROR'
 
 # Function to get hourly meteorological data
 def get_hourly_meteorological_data(station_code, start_date, end_date):
     params = {"obscd": station_code, "startdt": start_date, "enddt": end_date, "output": "json"}
-    response = requests.get(HOURLY_METEO_URL, params=params)
+    response = requests.get(HOURLY_METEO_URL, params=params, timeout=WAMIS_TIMEOUT)
     return response.json() if response.status_code == 200 else 'ERROR'
 
 # Function to get daily meteorological data
 def get_daily_meteorological_data(station_code, start_date, end_date):
     params = {"obscd": station_code, "startdt": start_date, "enddt": end_date, "output": "json"}
-    response = requests.get(DAILY_METEO_URL, params=params)
+    response = requests.get(DAILY_METEO_URL, params=params, timeout=WAMIS_TIMEOUT)
     return response.json() if response.status_code == 200 else 'ERROR'
 
 # Function to transform lat/lon from DMS to decimal
@@ -236,19 +242,21 @@ def try_parse_h(date):
 
 # Retry function for resilience
 def retry(func, max_attempts=3, sleep_time=5):
-    attempts = 0
-    while attempts < max_attempts:
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
         try:
-            return func()
+            result = func()
+            if result is None:
+                raise ValueError("Function returned None")
+            return result
         except Exception as e:
-            print(f"Error: {e}. Retrying...")
+            last_error = e
+            logger.warning(f"Attempt {attempt}/{max_attempts} failed: {e}. Retrying in {sleep_time}s...")
             sleep(sleep_time)
-            attempts += 1
-    raise Exception(f"Failed after {max_attempts} attempts.")
+    raise RuntimeError(f"Failed after {max_attempts} attempts. Last error: {last_error}")
 
 # Resource Patch (CKAN Upload)
 def upload_ckan(name='Daily Water Level Data', description='Test Data', url='https://data.dev-wins.com/api/action/resource_patch', pathtofile="daily_wl_data.csv", resource_id="XXXXXX", package_id="YYYYYY"):
-    files = {'upload': open(pathtofile, 'rb')}
     headers = {"Authorization": APIdev}
     data_dict = {
         'id': resource_id,
@@ -257,16 +265,25 @@ def upload_ckan(name='Daily Water Level Data', description='Test Data', url='htt
         'name': name,
         'description': description
     }
-    # POST request
-    response = requests.post(url, headers=headers, data=data_dict, files=files)
-    
-    # Logging
-    print("Status Code", response.status_code)
-    print("JSON Response", response.json())
+    with open(pathtofile, 'rb') as f:
+        files = {'upload': f}
+        response = requests.post(url, headers=headers, data=data_dict, files=files, timeout=CKAN_TIMEOUT)
+
+    if response.status_code == 200:
+        resp_data = response.json()
+        if resp_data.get('success'):
+            logger.info(f"Upload OK: {name} (status={response.status_code})")
+        else:
+            logger.error(f"Upload failed for {name}: {resp_data.get('error', resp_data)}")
+    else:
+        logger.error(f"Upload HTTP error for {name}: {response.status_code} - {response.text[:200]}")
 
 # Function to process and save hourly precipitation data
 def process_hourly_precipitation():
     stations = get_stations()
+    if not stations or 'list' not in stations:
+        raise RuntimeError("Failed to fetch precipitation stations from WAMIS API")
+
     all_precipitation_data = pd.DataFrame()
     start_date, end_date = get_korean_time_range()
 
@@ -285,7 +302,7 @@ def process_hourly_precipitation():
             station_lat = converted_coords['lat']
             station_lon = converted_coords['lon']
             
-            print(f"Downloading hourly data for station: {station_name} ({station_code})")
+            logger.info(f"Downloading hourly data for station: {station_name} ({station_code})")
             
             def get_data():
                 return get_hourly_precipitation(station_code, start_date, end_date)
@@ -317,14 +334,17 @@ def process_hourly_precipitation():
     all_precipitation_data.loc[all_precipitation_data['rf'] == "-", 'rf'] = ""
     all_precipitation_data.to_csv("hourly_precipitation_data.csv", index=False)
     
-    print("Hourly precipitation data saved.")
-    print("Uploading data to IHP-WINS...")
+    logger.info("Hourly precipitation data saved.")
+    logger.info("Uploading data to IHP-WINS...")
     upload_ckan(name = resourceIdKrPPHourlyName, description = resourceIdKrPPHourlyDescription, url = urlPatch,  pathtofile = "hourly_precipitation_data.csv",  resource_id = resourceIdKrPPHourly, package_id = packageIdKr)
-    print("Upload done")
+    logger.info("Upload done")
 
 # Function to process and save daily precipitation data
 def process_daily_precipitation():
     stations = get_stations()
+    if not stations or 'list' not in stations:
+        raise RuntimeError("Failed to fetch precipitation stations from WAMIS API")
+
     all_precipitation_data = pd.DataFrame()
     start_date, end_date = get_korean_time_range(hours_back=2160)
 
@@ -343,7 +363,7 @@ def process_daily_precipitation():
             station_lat = converted_coords['lat']
             station_lon = converted_coords['lon']
 
-            print(f"Downloading daily data for station: {station_name} ({station_code})")
+            logger.info(f"Downloading daily data for station: {station_name} ({station_code})")
 
             def get_data():
                 return get_daily_precipitation(station_code, start_date, end_date)
@@ -378,14 +398,17 @@ def process_daily_precipitation():
     all_precipitation_data.loc[all_precipitation_data['rf'] == "-", 'rf'] = ""
     all_precipitation_data.to_csv("daily_precipitation_data.csv", index=False)
 
-    print("Daily precipitation data saved.")
-    print("Uploading data to IHP-WINS")
+    logger.info("Daily precipitation data saved.")
+    logger.info("Uploading data to IHP-WINS")
     upload_ckan(name = resourceIdKrPPDailyName, description = resourceIdKrPPDailyDescription, url = urlPatch,  pathtofile = "daily_precipitation_data.csv",  resource_id = resourceIdKrPPDaily, package_id = packageIdKr)
-    print("Upload done")
+    logger.info("Upload done")
 
 # Function to process and save daily precipitation data
 def process_monthly_precipitation():
     stations = get_stations()
+    if not stations or 'list' not in stations:
+        raise RuntimeError("Failed to fetch precipitation stations from WAMIS API")
+
     all_precipitation_data = pd.DataFrame()
     start_date, end_date = get_korean_time_range(hours_back=26280)
     start_date = start_date[:4]
@@ -406,7 +429,7 @@ def process_monthly_precipitation():
             station_lat = converted_coords['lat']
             station_lon = converted_coords['lon']
 
-            print(f"Downloading monthly data for station: {station_name} ({station_code})")
+            logger.info(f"Downloading monthly data for station: {station_name} ({station_code})")
 
             def get_data():
                 return get_monthly_precipitation(station_code, start_date, end_date)
@@ -441,14 +464,17 @@ def process_monthly_precipitation():
     all_precipitation_data.loc[all_precipitation_data['dtrf'] == "-", 'dtrf'] = ""
     all_precipitation_data.to_csv("monthly_precipitation_data.csv", index=False)
 
-    print("Monthly precipitation data saved.")
-    print("Uploading data to IHP-WINS")
+    logger.info("Monthly precipitation data saved.")
+    logger.info("Uploading data to IHP-WINS")
     upload_ckan(name = resourceIdKrPPMonthlyName, description = resourceIdKrPPMonthlyDescription, url = urlPatch,  pathtofile = "monthly_precipitation_data.csv",  resource_id = resourceIdKrPPMonthly, package_id = packageIdKr)
-    print("Upload done")
+    logger.info("Upload done")
     
 # Function to process and save hourly water level data
 def process_hourly_water_level():
     stations = get_stations(WL_STATIONS_URL)
+    if not stations or 'list' not in stations:
+        raise RuntimeError("Failed to fetch water level stations from WAMIS API")
+
     all_wl_data = pd.DataFrame()
     start_date, end_date = get_korean_time_range()
 
@@ -467,7 +493,7 @@ def process_hourly_water_level():
             station_lat = converted_coords['lat']
             station_lon = converted_coords['lon']
 
-            print(f"Downloading hourly water level data for station: {station_name} ({station_code})")
+            logger.info(f"Downloading hourly water level data for station: {station_name} ({station_code})")
 
             def get_data():
                 return get_hourly_water_level(station_code, start_date, end_date)
@@ -491,14 +517,17 @@ def process_hourly_water_level():
     all_wl_data.loc[all_wl_data['wl'] == "-", 'wl'] = ""
     all_wl_data.to_csv("hourly_wl_data.csv", index=False)
 
-    print("Hourly water level data saved.")
-    print("Uploading data to IHP-WINS...")
+    logger.info("Hourly water level data saved.")
+    logger.info("Uploading data to IHP-WINS...")
     upload_ckan(name=resourceIdKrWLHourlyName, description=resourceIdKrWLHourlyDescription, pathtofile="hourly_wl_data.csv", url = urlPatch, resource_id = resourceIdKrWLHourly, package_id = packageIdKr)
-    print("Upload done")
+    logger.info("Upload done")
 
 # Function to process and save daily water level data
 def process_daily_water_level():
     stations = get_stations(WL_STATIONS_URL)
+    if not stations or 'list' not in stations:
+        raise RuntimeError("Failed to fetch water level stations from WAMIS API")
+
     all_wl_data = pd.DataFrame()
     start_date, end_date = get_korean_time_range(hours_back=2160)
 
@@ -518,7 +547,7 @@ def process_daily_water_level():
             station_lon = converted_coords['lon']
 
 
-            print(f"Downloading daily water level data for station: {station_name} ({station_code})")
+            logger.info(f"Downloading daily water level data for station: {station_name} ({station_code})")
 
             def get_data():
                 return get_daily_water_level(station_code, start_date, end_date)
@@ -560,15 +589,18 @@ def process_daily_water_level():
     all_wl_data.loc[all_wl_data['wl'] == "-", 'wl'] = ""
     all_wl_data.to_csv("daily_wl_data.csv", index=False)
 
-    print("Daily water level data saved.")
-    print("Uploading data to IHP-WINS...")
+    logger.info("Daily water level data saved.")
+    logger.info("Uploading data to IHP-WINS...")
     upload_ckan(name=resourceIdKrWLDailyName, description=resourceIdKrWLDailyDescription, pathtofile="daily_wl_data.csv", url = urlPatch, resource_id=resourceIdKrWLDaily, package_id=packageIdKr)
-    print("Upload done")
+    logger.info("Upload done")
 
 
 # Function to process and save hourly meteorological data
 def process_hourly_meteorological_data():
     stations = get_stations(METEO_STATIONS_URL)
+    if not stations or 'list' not in stations:
+        raise RuntimeError("Failed to fetch meteorological stations from WAMIS API")
+
     all_meteo_data = pd.DataFrame()
     start_date, end_date = get_korean_time_range()
 
@@ -587,7 +619,7 @@ def process_hourly_meteorological_data():
             station_lat = converted_coords['lat']
             station_lon = converted_coords['lon']
 
-            print(f"Downloading hourly meteorological data for station: {station_name} ({station_code})")
+            logger.info(f"Downloading hourly meteorological data for station: {station_name} ({station_code})")
 
             def get_data():
                 return get_hourly_meteorological_data(station_code, start_date, end_date)
@@ -636,14 +668,17 @@ def process_hourly_meteorological_data():
 
     all_meteo_data.to_csv("hourly_meteo_data.csv", index=False)
 
-    print("Hourly meteorological data saved.")
-    print("Uploading data to IHP-WINS...")
+    logger.info("Hourly meteorological data saved.")
+    logger.info("Uploading data to IHP-WINS...")
     upload_ckan(name=resourceIdKrMetHourlyName, description=resourceIdKrMetHourlyDescription, pathtofile="hourly_meteo_data.csv", url = urlPatch, resource_id=resourceIdKrMetHourly, package_id=packageIdKr)
-    print("Upload done")
+    logger.info("Upload done")
 
 # Function to process and save daily meteorological data
 def process_daily_meteorological_data():
     stations = get_stations(METEO_STATIONS_URL)
+    if not stations or 'list' not in stations:
+        raise RuntimeError("Failed to fetch meteorological stations from WAMIS API")
+
     all_meteo_data = pd.DataFrame()
     start_date, end_date = get_korean_time_range(hours_back=2160)
 
@@ -662,7 +697,7 @@ def process_daily_meteorological_data():
             station_lat = converted_coords['lat']
             station_lon = converted_coords['lon']
 
-            print(f"Downloading daily meteorological data for station: {station_name} ({station_code})")
+            logger.info(f"Downloading daily meteorological data for station: {station_name} ({station_code})")
 
             def get_data():
                 return get_daily_meteorological_data(station_code, start_date, end_date)
@@ -719,26 +754,29 @@ def process_daily_meteorological_data():
 
     all_meteo_data.to_csv("daily_meteo_data.csv", index=False)
 
-    print("Daily meteorological data saved.")
-    print("Uploading data to IHP-WINS...")
+    logger.info("Daily meteorological data saved.")
+    logger.info("Uploading data to IHP-WINS...")
     upload_ckan(name=resourceIdKrMetDailyName, description=resourceIdKrMetDailyDescription, pathtofile="daily_meteo_data.csv", url = urlPatch, resource_id=resourceIdKrMetDaily, package_id=packageIdKr)
-    print("Upload done")
+    logger.info("Upload done")
     
 # Function to get daily flow rate data
 def get_daily_flow_rate(station_code, year):
     params = {"obscd": station_code, "year": year, "output": "json"}
-    response = requests.get(DAILY_FLOW_RATE, params=params)
+    response = requests.get(DAILY_FLOW_RATE, params=params, timeout=WAMIS_TIMEOUT)
     return response.json() if response.status_code == 200 else 'ERROR'
 
 # Function to get suspended sediment load data
 def get_suspended_sediment_load(station_code, start_year, end_year):
     params = {"obscd": station_code, "startyear": start_year, "endyear": end_year, "output": "json"}
-    response = requests.get(SSL_STATION_DATA, params=params)
+    response = requests.get(SSL_STATION_DATA, params=params, timeout=WAMIS_TIMEOUT)
     return response.json() if response.status_code == 200 else 'ERROR'
 
 # Example functions to process flow rate and suspended sediment load
 def process_flow_rate():
     stations = get_stations(FLOW_RATE_STATION_INFO)
+    if not stations or 'list' not in stations:
+        raise RuntimeError("Failed to fetch flow rate stations from WAMIS API")
+
     all_flow_data = pd.DataFrame()
 
     for station in stations['list']:
@@ -764,13 +802,16 @@ def process_flow_rate():
             
     all_flow_data.loc[all_flow_data['fw'] == "-", 'fw'] = ""
     all_flow_data.to_csv("daily_flow_rate_data.csv", index=False)
-    print("Daily flow rate data saved.")
-    print("Uploading data to IHP-WINS...")
+    logger.info("Daily flow rate data saved.")
+    logger.info("Uploading data to IHP-WINS...")
     upload_ckan(name=resourceIdKrFRDailyName, description=resourceIdKrFRDailyDescription, url = urlPatch, pathtofile="daily_flow_rate_data.csv", resource_id=resourceIdKrFRDaily , package_id=packageIdKr)
-    print("Upload done")
+    logger.info("Upload done")
 
 def process_suspended_sediment_load():
     stations = get_stations(SSL_STATION_INFO)
+    if not stations or 'list' not in stations:
+        raise RuntimeError("Failed to fetch sediment load stations from WAMIS API")
+
     all_ssl_data = pd.DataFrame()
     start_year = datetime.now().year - 3  
     end_year = datetime.now().year
@@ -791,10 +832,10 @@ def process_suspended_sediment_load():
             all_ssl_data = pd.concat([all_ssl_data, station_data], ignore_index=True)
 
     all_ssl_data.to_csv("suspended_sediment_load_data.csv", index=False)
-    print("Suspended sediment load data saved.")
-    print("Uploading data to IHP-WINS...")
+    logger.info("Suspended sediment load data saved.")
+    logger.info("Uploading data to IHP-WINS...")
     upload_ckan(name=resourceIdKrSSLName, description=resourceIdKrSSLDescription, url = urlPatch, pathtofile="suspended_sediment_load_data.csv", resource_id=resourceIdKrSSL, package_id=packageIdKr)
-    print("Upload done")
+    logger.info("Upload done")
     
 
 # Define the hourly DAG
