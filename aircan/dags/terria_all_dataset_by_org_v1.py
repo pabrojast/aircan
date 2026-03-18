@@ -819,8 +819,8 @@ def upload_ckan(file_path, entity_name=None, entity_type='organization'):
                 patch_data = {
                     "id": package_id,
                     "title": expected_title,
-                    "title_translated": {"en": expected_title, "es": "", "fr": ""},
-                    "notes_translated": {
+                    "title_translated": json.dumps({"en": expected_title, "es": "", "fr": ""}),
+                    "notes_translated": json.dumps({
                         "en": (
                             "This dataset contains a collection of JSON files used to configure "
                             "map catalogs in TerriaJS, an interactive geospatial data visualization "
@@ -833,7 +833,7 @@ def upload_ckan(file_path, entity_name=None, entity_type='organization'):
                         ),
                         "es": "",
                         "fr": "",
-                    },
+                    }),
                     # Required scheming fields for CKAN 2.10 validation
                     "contact_email": pkg.get("contact_email", ""),
                     "dcat_type": pkg.get("dcat_type", ""),
