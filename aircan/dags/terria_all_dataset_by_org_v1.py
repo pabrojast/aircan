@@ -810,6 +810,45 @@ def upload_ckan(file_path, entity_name=None, entity_type='organization'):
             package_id = package_data['result']['id']
             resources = package_data['result'].get('resources', [])
 
+            # Ensure the dataset has the correct title and description
+            expected_title = "TerriaJS Map Catalog in JSON Format"
+            current_title = package_data['result'].get('title', '')
+            if current_title != expected_title:
+                patch_url = f"{ckan_api_url}package_patch"
+                pkg = package_data['result']
+                patch_data = {
+                    "id": package_id,
+                    "title": expected_title,
+                    "title_translated": {"en": expected_title, "es": "", "fr": ""},
+                    "notes_translated": {
+                        "en": (
+                            "This dataset contains a collection of JSON files used to configure "
+                            "map catalogs in TerriaJS, an interactive geospatial data visualization "
+                            "platform. The files include detailed configurations for services such as "
+                            "WMS, WFS, and other geospatial resources, enabling the integration and "
+                            "visualization of diverse datasets in a user-friendly web interface. "
+                            "This resource is ideal for developers, researchers, and professionals "
+                            "who wish to customize or implement interactive map catalogs in their "
+                            "own applications using TerriaJS."
+                        ),
+                        "es": "",
+                        "fr": "",
+                    },
+                    # Required scheming fields for CKAN 2.10 validation
+                    "contact_email": pkg.get("contact_email", ""),
+                    "dcat_type": pkg.get("dcat_type", ""),
+                    "identifier": pkg.get("identifier", ""),
+                    "language": pkg.get("language", ""),
+                    "topic": pkg.get("topic", ""),
+                }
+                patch_resp = requests.post(
+                    patch_url, json=patch_data, headers=headers, timeout=TIMEOUT_SECONDS
+                )
+                if patch_resp.status_code == 200 and patch_resp.json().get('success'):
+                    logger.info("Dataset metadata updated (title & description)")
+                else:
+                    logger.warning(f"Failed to update dataset metadata: {patch_resp.text[:200]}")
+
             # Determine the final name and description based on entity type
             if entity_name:
                 if entity_type == 'organization':
