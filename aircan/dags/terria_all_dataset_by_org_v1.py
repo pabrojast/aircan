@@ -184,6 +184,16 @@ def process_sld_styles(style_url, resource_format):
 
                 valid_property_name = None  # To store a valid property name
 
+                # ElementTree Element.__bool__() returns False for elements
+                # with 0 children even if they have text, so we must use
+                # 'is not None' checks instead of 'or' chains.
+                def _find_first(element, xpaths, ns):
+                    for xpath in xpaths:
+                        result = element.find(xpath, ns)
+                        if result is not None:
+                            return result
+                    return None
+
                 try:
                     # Enhanced SLD processing similar to the updated plugin
                     rules = root.findall('.//se:Rule', namespaces)
@@ -210,22 +220,21 @@ def process_sld_styles(style_url, resource_format):
                                 # ElseFilter rules don't have specific property values, skip them for styling
                                 print(f"Rule {i+1}: Found ElseFilter - skipping for categorical styling")
                                 continue
-                            
-                            # Enhanced rule processing
-                            name = rule.find('se:Name', namespaces) or rule.find('sld:Name', namespaces) or rule.find('Name')
-                            title = rule.find('.//se:Title', namespaces) or rule.find('.//sld:Title', namespaces) or rule.find('.//Title')
+
+                            name = _find_first(rule, ['se:Name', 'sld:Name', 'Name'], namespaces)
+                            title = _find_first(rule, ['.//se:Title', './/sld:Title', './/Title'], namespaces)
                             
                             # Enhanced color extraction - try multiple patterns
-                            fill = (rule.find('.//se:Fill/se:SvgParameter[@name="fill"]', namespaces) or
-                                   rule.find('.//sld:Fill/sld:CssParameter[@name="fill"]', namespaces) or
-                                   rule.find('.//Fill/CssParameter[@name="fill"]') or
-                                   rule.find('.//se:PolygonSymbolizer/se:Fill/se:SvgParameter[@name="fill"]', namespaces))
+                            fill = _find_first(rule, [
+                                './/se:Fill/se:SvgParameter[@name="fill"]',
+                                './/sld:Fill/sld:CssParameter[@name="fill"]',
+                                './/Fill/CssParameter[@name="fill"]',
+                                './/se:PolygonSymbolizer/se:Fill/se:SvgParameter[@name="fill"]',
+                            ], namespaces)
                             
                             # Enhanced property extraction
-                            property_name_element = (rule.find('.//ogc:PropertyName', namespaces) or 
-                                                   rule.find('.//PropertyName'))
-                            property_value_element = (rule.find('.//ogc:Literal', namespaces) or 
-                                                    rule.find('.//Literal'))
+                            property_name_element = _find_first(rule, ['.//ogc:PropertyName', './/PropertyName'], namespaces)
+                            property_value_element = _find_first(rule, ['.//ogc:Literal', './/Literal'], namespaces)
 
                             if fill is not None and fill.text and (name is not None or title is not None):
                                 color = fill.text.strip()
