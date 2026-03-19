@@ -141,3 +141,7 @@ cython_debug/
 
 # VS Code
 .vscode/
+AIRCAN_ANALYSIS.md
+INDEX.md
+JSON_UPDATE_FLOW_DIAGRAM.md
+README_EXPLORATION.md
