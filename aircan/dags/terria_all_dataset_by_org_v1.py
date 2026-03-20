@@ -824,19 +824,26 @@ def upload_ckan(file_path, entity_name=None, entity_type='organization'):
             )
             current_title = package_data['result'].get('title', '')
             current_notes = package_data['result'].get('notes', '')
-            if current_title != expected_title or current_notes != expected_notes:
+            current_title_translated = package_data['result'].get('title_translated', {})
+            expected_title_translated = {"en": expected_title, "es": "", "fr": ""}
+            needs_update = (
+                current_title != expected_title
+                or current_notes != expected_notes
+                or current_title_translated != expected_title_translated
+            )
+            if needs_update:
                 patch_url = f"{ckan_api_url}package_patch"
                 pkg = package_data['result']
                 patch_data = {
                     "id": package_id,
                     "title": expected_title,
                     "notes": expected_notes,
-                    "title_translated": json.dumps({"en": expected_title, "es": "", "fr": ""}),
-                    "notes_translated": json.dumps({
+                    "title_translated": {"en": expected_title, "es": "", "fr": ""},
+                    "notes_translated": {
                         "en": expected_notes,
                         "es": "",
                         "fr": "",
-                    }),
+                    },
                     # Required scheming fields for CKAN 2.10 validation
                     "contact_email": pkg.get("contact_email", ""),
                     "dcat_type": pkg.get("dcat_type", ""),
