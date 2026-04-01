@@ -26,6 +26,29 @@ formatos_permitidos = ['KML', 'tif', 'tiff', 'geotiff', 'csv', 'wms', 'wmts', 's
 # Timeout configuration (add timeouts to prevent tasks from hanging)
 TIMEOUT_SECONDS = 120
 
+CATALOG_DATASET_SLUG = "terriajs-map-catalog-in-json-format"
+CATALOG_DATASET_TITLE = "TerriaJS Map Catalog in JSON Format"
+CATALOG_DATASET_NOTES = (
+    "This dataset contains a collection of JSON files used to configure "
+    "map catalogs in TerriaJS, an interactive geospatial data visualization "
+    "platform. The files include detailed configurations for services such as "
+    "WMS, WFS, and other geospatial resources, enabling the integration and "
+    "visualization of diverse datasets in a user-friendly web interface. "
+    "This resource is ideal for developers, researchers, and professionals "
+    "who wish to customize or implement interactive map catalogs in their "
+    "own applications using TerriaJS."
+)
+CATALOG_DATASET_TITLE_TRANSLATED = {
+    "en": CATALOG_DATASET_TITLE,
+    "es": "",
+    "fr": "",
+}
+CATALOG_DATASET_NOTES_TRANSLATED = {
+    "en": CATALOG_DATASET_NOTES,
+    "es": "",
+    "fr": "",
+}
+
 # Retry configuration
 retry_strategy = Retry(
     total=2,
@@ -795,69 +818,169 @@ def upload_ckan(file_path, entity_name=None, entity_type='organization'):
     """
     headers = {"Authorization": APIdev}
 
+    def _safe_json(response):
+        try:
+            return response.json()
+        except ValueError:
+            return {"success": False, "raw": response.text[:500]}
+
+    def _extras_to_dict(package):
+        extras = {}
+        for item in package.get("extras", []):
+            key = item.get("key")
+            if key:
+                extras[key] = item.get("value")
+        return extras
+
+    def _parse_translated_field(value):
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value:
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, dict):
+                    return parsed
+            except (TypeError, ValueError):
+                return {}
+        return {}
+
+    def _build_package_metadata_payload(package):
+        extras = _extras_to_dict(package)
+        payload = {
+            "id": package["id"],
+            "name": package["name"],
+            "owner_org": package.get("owner_org"),
+            "private": package.get("private", False),
+            "license_id": package.get("license_id") or "notspecified",
+            "type": package.get("type", "dataset"),
+            "title": CATALOG_DATASET_TITLE,
+            "notes": CATALOG_DATASET_NOTES,
+            "title_translated": CATALOG_DATASET_TITLE_TRANSLATED,
+            "notes_translated": CATALOG_DATASET_NOTES_TRANSLATED,
+            "version": package.get("version", ""),
+            "url": package.get("url"),
+            "author": package.get("author", ""),
+            "author_email": package.get("author_email", ""),
+            "maintainer": package.get("maintainer", ""),
+            "maintainer_email": package.get("maintainer_email", ""),
+            "tags": [
+                {"name": tag["name"]}
+                for tag in package.get("tags", [])
+                if tag.get("name")
+            ],
+            "groups": [
+                {"id": group["id"]}
+                for group in package.get("groups", [])
+                if group.get("id")
+            ],
+            "extras": package.get("extras", []),
+            # CKAN scheming fields may live at top level or inside extras.
+            "contact_email": package.get("contact_email", extras.get("contact_email", "")),
+            "dcat_type": package.get("dcat_type", extras.get("dcat_type", "")),
+            "identifier": package.get("identifier", extras.get("identifier", "")),
+            "language": package.get("language", extras.get("language", "")),
+            "topic": package.get("topic", extras.get("topic", "")),
+        }
+        return {key: value for key, value in payload.items() if value is not None}
+
+    def _metadata_is_synced(package):
+        extras = _extras_to_dict(package)
+        current_title_translated = _parse_translated_field(
+            package.get("title_translated", extras.get("title_translated", {}))
+        )
+        current_notes_translated = _parse_translated_field(
+            package.get("notes_translated", extras.get("notes_translated", {}))
+        )
+        return (
+            package.get("title", "") == CATALOG_DATASET_TITLE
+            and package.get("notes", "") == CATALOG_DATASET_NOTES
+            and (
+                not current_title_translated
+                or current_title_translated == CATALOG_DATASET_TITLE_TRANSLATED
+            )
+            and (
+                not current_notes_translated
+                or current_notes_translated == CATALOG_DATASET_NOTES_TRANSLATED
+            )
+        )
+
+    def _refresh_package(package_id):
+        package_show_url = f"{ckan_api_url}package_show"
+        response = requests.post(
+            package_show_url,
+            json={"id": package_id},
+            headers=headers,
+            timeout=TIMEOUT_SECONDS
+        )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Failed to refresh package {package_id}: "
+                f"{response.status_code} - {response.text[:200]}"
+            )
+        body = _safe_json(response)
+        if not body.get("success"):
+            raise RuntimeError(f"Failed to refresh package {package_id}: {body}")
+        return body["result"]
+
+    def _sync_catalog_package_metadata(package):
+        if _metadata_is_synced(package):
+            return package
+
+        payload = _build_package_metadata_payload(package)
+        actions = ("package_patch", "package_update")
+        errors = []
+
+        for action in actions:
+            action_url = f"{ckan_api_url}{action}"
+            response = requests.post(
+                action_url,
+                json=payload,
+                headers=headers,
+                timeout=TIMEOUT_SECONDS
+            )
+            body = _safe_json(response)
+            if response.status_code == 200 and body.get("success"):
+                refreshed_package = _refresh_package(package["id"])
+                if _metadata_is_synced(refreshed_package):
+                    logger.info(
+                        "Dataset metadata updated via %s (title & description)",
+                        action
+                    )
+                    return refreshed_package
+                errors.append(
+                    f"{action} returned success but metadata verification failed"
+                )
+            else:
+                errors.append(
+                    f"{action} failed: status={response.status_code}, body={body}"
+                )
+
+        logger.error(
+            "Failed to synchronize dataset metadata for %s. %s",
+            package.get("name", package.get("id", "unknown-package")),
+            " | ".join(errors)
+        )
+        return package
+
     # Get the ID of the package (use POST for CKAN 2.10+ compatibility)
     package_show_url = f"{ckan_api_url}package_show"
 
     try:
         response = requests.post(
             package_show_url,
-            json={"id": "terriajs-map-catalog-in-json-format"},
+            json={"id": CATALOG_DATASET_SLUG},
             headers=headers,
             timeout=TIMEOUT_SECONDS
         )
         if response.status_code == 200:
-            package_data = response.json()
-            package_id = package_data['result']['id']
-            resources = package_data['result'].get('resources', [])
+            package_data = _safe_json(response)
+            if not package_data.get("success"):
+                logger.error(f"Failed to parse package_show response: {package_data}")
+                return
 
-            # Ensure the dataset has the correct title and description
-            expected_title = "TerriaJS Map Catalog in JSON Format"
-            expected_notes = (
-                "This dataset contains a collection of JSON files used to configure "
-                "map catalogs in TerriaJS, an interactive geospatial data visualization "
-                "platform. The files include detailed configurations for services such as "
-                "WMS, WFS, and other geospatial resources, enabling the integration and "
-                "visualization of diverse datasets in a user-friendly web interface. "
-                "This resource is ideal for developers, researchers, and professionals "
-                "who wish to customize or implement interactive map catalogs in their "
-                "own applications using TerriaJS."
-            )
-            current_title = package_data['result'].get('title', '')
-            current_notes = package_data['result'].get('notes', '')
-            current_title_translated = package_data['result'].get('title_translated', {})
-            expected_title_translated = {"en": expected_title, "es": "", "fr": ""}
-            needs_update = (
-                current_title != expected_title
-                or current_notes != expected_notes
-                or current_title_translated != expected_title_translated
-            )
-            if needs_update:
-                patch_url = f"{ckan_api_url}package_patch"
-                pkg = package_data['result']
-                patch_data = {
-                    "id": package_id,
-                    "title": expected_title,
-                    "notes": expected_notes,
-                    "title_translated": {"en": expected_title, "es": "", "fr": ""},
-                    "notes_translated": {
-                        "en": expected_notes,
-                        "es": "",
-                        "fr": "",
-                    },
-                    # Required scheming fields for CKAN 2.10 validation
-                    "contact_email": pkg.get("contact_email", ""),
-                    "dcat_type": pkg.get("dcat_type", ""),
-                    "identifier": pkg.get("identifier", ""),
-                    "language": pkg.get("language", ""),
-                    "topic": pkg.get("topic", ""),
-                }
-                patch_resp = requests.post(
-                    patch_url, json=patch_data, headers=headers, timeout=TIMEOUT_SECONDS
-                )
-                if patch_resp.status_code == 200 and patch_resp.json().get('success'):
-                    logger.info("Dataset metadata updated (title & description)")
-                else:
-                    logger.warning(f"Failed to update dataset metadata: {patch_resp.text[:200]}")
+            package = _sync_catalog_package_metadata(package_data["result"])
+            package_id = package['id']
+            resources = package.get('resources', [])
 
             # Determine the final name and description based on entity type
             if entity_name:
