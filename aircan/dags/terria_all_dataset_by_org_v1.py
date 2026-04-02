@@ -844,36 +844,14 @@ def upload_ckan(file_path, entity_name=None, entity_type='organization'):
                 return {}
         return {}
 
-    def _build_package_metadata_payload(package):
+    def _build_package_metadata_patch_payload(package):
         extras = _extras_to_dict(package)
         payload = {
             "id": package["id"],
-            "name": package["name"],
-            "owner_org": package.get("owner_org"),
-            "private": package.get("private", False),
-            "license_id": package.get("license_id") or "notspecified",
-            "type": package.get("type", "dataset"),
             "title": CATALOG_DATASET_TITLE,
             "notes": CATALOG_DATASET_NOTES,
-            "title_translated": CATALOG_DATASET_TITLE_TRANSLATED,
-            "notes_translated": CATALOG_DATASET_NOTES_TRANSLATED,
-            "version": package.get("version", ""),
-            "url": package.get("url"),
-            "author": package.get("author", ""),
-            "author_email": package.get("author_email", ""),
-            "maintainer": package.get("maintainer", ""),
-            "maintainer_email": package.get("maintainer_email", ""),
-            "tags": [
-                {"name": tag["name"]}
-                for tag in package.get("tags", [])
-                if tag.get("name")
-            ],
-            "groups": [
-                {"id": group["id"]}
-                for group in package.get("groups", [])
-                if group.get("id")
-            ],
-            "extras": package.get("extras", []),
+            "title_translated": json.dumps(CATALOG_DATASET_TITLE_TRANSLATED),
+            "notes_translated": json.dumps(CATALOG_DATASET_NOTES_TRANSLATED),
             # CKAN scheming fields may live at top level or inside extras.
             "contact_email": package.get("contact_email", extras.get("contact_email", "")),
             "dcat_type": package.get("dcat_type", extras.get("dcat_type", "")),
@@ -926,39 +904,37 @@ def upload_ckan(file_path, entity_name=None, entity_type='organization'):
         if _metadata_is_synced(package):
             return package
 
-        payload = _build_package_metadata_payload(package)
-        actions = ("package_patch", "package_update")
-        errors = []
+        payload = _build_package_metadata_patch_payload(package)
+        patch_url = f"{ckan_api_url}package_patch"
+        response = requests.post(
+            patch_url,
+            json=payload,
+            headers=headers,
+            timeout=TIMEOUT_SECONDS
+        )
+        body = _safe_json(response)
 
-        for action in actions:
-            action_url = f"{ckan_api_url}{action}"
-            response = requests.post(
-                action_url,
-                json=payload,
-                headers=headers,
-                timeout=TIMEOUT_SECONDS
+        if response.status_code == 200 and body.get("success"):
+            refreshed_package = _refresh_package(package["id"])
+            if _metadata_is_synced(refreshed_package):
+                logger.info("Dataset metadata updated via package_patch")
+                return refreshed_package
+
+            logger.warning(
+                "package_patch succeeded for %s but metadata verification failed",
+                package.get("name", package.get("id", "unknown-package"))
             )
-            body = _safe_json(response)
-            if response.status_code == 200 and body.get("success"):
-                refreshed_package = _refresh_package(package["id"])
-                if _metadata_is_synced(refreshed_package):
-                    logger.info(
-                        "Dataset metadata updated via %s (title & description)",
-                        action
-                    )
-                    return refreshed_package
-                errors.append(
-                    f"{action} returned success but metadata verification failed"
-                )
-            else:
-                errors.append(
-                    f"{action} failed: status={response.status_code}, body={body}"
-                )
+            return refreshed_package
 
+        # Do not fall back to package_update here. Updating a dataset without
+        # explicitly preserving its resources can cause CKAN to recreate or
+        # drop them, which changes resource IDs and leaves only the last upload.
         logger.error(
-            "Failed to synchronize dataset metadata for %s. %s",
+            "Failed to synchronize dataset metadata for %s via package_patch. "
+            "status=%s body=%s",
             package.get("name", package.get("id", "unknown-package")),
-            " | ".join(errors)
+            response.status_code,
+            body
         )
         return package
 
