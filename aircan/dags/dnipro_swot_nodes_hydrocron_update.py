@@ -106,6 +106,7 @@ class NodeUpdate:
     final_rows: int = 0
     first_observation_utc: str = ""
     latest_observation_utc: str = ""
+    blob_downloaded: bool = False
     message: str = ""
 
 
@@ -265,8 +266,10 @@ def observation_bounds(frame: pd.DataFrame) -> tuple[str, str]:
 def download_blob(container: ContainerClient, name: str) -> tuple[bytes | None, str | None]:
     client = container.get_blob_client(name)
     try:
-        props = client.get_blob_properties()
-        return client.download_blob().readall(), props.etag
+        downloader = client.download_blob()
+        properties = getattr(downloader, "properties", None)
+        etag = getattr(properties, "etag", None) if properties is not None else None
+        return downloader.readall(), etag
     except ResourceNotFoundError:
         return None, None
 
@@ -278,19 +281,25 @@ def upload_blob(container: ContainerClient, name: str, data: bytes, content_type
 
 
 def update_one(
-    node_id: str,
+    node_properties: dict[str, Any],
     container: ContainerClient,
     global_start: datetime,
     end: datetime,
     overlap_hours: int,
     timeout: int,
     retries: int,
+    write_changes: bool = True,
 ) -> NodeUpdate:
+    node_id = clean_id(node_properties.get("node_id", ""))
     blob_name = f"{CSV_PREFIX}/node_{safe_id(node_id)}.csv"
     try:
-        previous_bytes, _ = download_blob(container, blob_name)
-        existing = read_csv_bytes(previous_bytes)
-        last = latest_time(existing)
+        previous_count = int(node_properties.get("observation_count") or 0)
+        previous_first = str(node_properties.get("first_observation_utc") or "")
+        previous_latest = str(node_properties.get("latest_observation_utc") or "")
+        try:
+            last = parse_utc(previous_latest) if previous_latest else None
+        except (TypeError, ValueError):
+            last = None
         start = (last or global_start) - timedelta(hours=overlap_hours)
         if start >= end:
             start = end - timedelta(hours=overlap_hours)
@@ -301,11 +310,39 @@ def update_one(
         }
         time.sleep(random.uniform(0.05, 0.2))
         response = get_with_retries(HYDROCRON_URL, params=params, timeout=timeout, retries=retries)
-        if response.status_code == 400 and existing.empty:
-            return NodeUpdate(node_id, "not_found", utc_text(start), utc_text(end))
+        if response.status_code == 400 and previous_count == 0:
+            return NodeUpdate(
+                node_id, "not_found", utc_text(start), utc_text(end),
+                final_rows=0,
+            )
         response.raise_for_status()
         raw = response_frame(response.text)
         incoming = filter_nodes(raw)
+
+        # The common daily path ends here: no accepted incoming observations
+        # means there is nothing to merge, so avoid downloading the historical
+        # node CSV solely to rediscover metadata already present in GeoJSON.
+        if incoming.empty:
+            return NodeUpdate(
+                node_id=node_id,
+                status="no_change",
+                start_time_utc=utc_text(start),
+                end_time_utc=utc_text(end),
+                input_rows=len(raw),
+                accepted_rows=0,
+                previous_rows=previous_count,
+                final_rows=previous_count,
+                first_observation_utc=previous_first,
+                latest_observation_utc=previous_latest,
+                blob_downloaded=False,
+            )
+
+        previous_bytes, _ = download_blob(container, blob_name)
+        if previous_bytes is None and previous_count > 0:
+            raise RuntimeError(
+                "GeoJSON reports existing observations but the node CSV blob is missing"
+            )
+        existing = read_csv_bytes(previous_bytes)
         previous_canonical = merge_nodes(
             pd.DataFrame(columns=OUTPUT_COLUMNS), existing
         )
@@ -315,7 +352,7 @@ def update_one(
         # may use different newline conventions; that alone must not trigger
         # tens of thousands of unnecessary blob replacements.
         changed = final_bytes != csv_bytes(previous_canonical)
-        if changed and not final.empty:
+        if write_changes and changed and not final.empty:
             upload_blob(container, blob_name, final_bytes, "text/csv; charset=utf-8")
         first, latest = observation_bounds(final)
         return NodeUpdate(
@@ -324,6 +361,7 @@ def update_one(
             start_time_utc=utc_text(start), end_time_utc=utc_text(end),
             input_rows=len(raw), accepted_rows=len(incoming), previous_rows=len(existing),
             final_rows=len(final), first_observation_utc=first, latest_observation_utc=latest,
+            blob_downloaded=True,
         )
     except Exception as exc:
         return NodeUpdate(node_id=node_id, status="error", message=str(exc), end_time_utc=utc_text(end))
@@ -359,24 +397,30 @@ def run_dnipro_swot_node_update(**_context) -> dict[str, Any]:
     geometry_response.raise_for_status()
     geojson = geometry_response.json()
     features = geojson.get("features", [])
-    node_ids = [clean_id(f.get("properties", {}).get("node_id", "")) for f in features]
-    node_ids = list(dict.fromkeys(value for value in node_ids if value))
+    node_records = []
+    seen_node_ids = set()
+    for feature in features:
+        properties = feature.get("properties", {}) or {}
+        node_id = clean_id(properties.get("node_id", ""))
+        if node_id and node_id not in seen_node_ids:
+            seen_node_ids.add(node_id)
+            node_records.append(properties)
     if limit:
-        node_ids = node_ids[:limit]
-    if not node_ids:
+        node_records = node_records[:limit]
+    if not node_records:
         raise RuntimeError("No node IDs found in published GeoJSON")
 
     state = load_json_blob(container, STATE_BLOB) or {}
     initial = str(vget("SWOT_NODE_INITIAL_START", DEFAULT_INITIAL_START))
     global_start = parse_utc(state.get("last_successful_end_utc", initial))
     end = datetime.now(timezone.utc)
-    logger.info("Updating %d nodes from global watermark %s to %s", len(node_ids), utc_text(global_start), utc_text(end))
+    logger.info("Updating %d nodes from global watermark %s to %s", len(node_records), utc_text(global_start), utc_text(end))
 
     results: list[NodeUpdate] = []
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
-            executor.submit(update_one, node_id, container, global_start, end, overlap, timeout, retries): node_id
-            for node_id in node_ids
+            executor.submit(update_one, properties, container, global_start, end, overlap, timeout, retries): clean_id(properties["node_id"])
+            for properties in node_records
         }
         for completed, future in enumerate(as_completed(futures), 1):
             results.append(future.result())
@@ -426,8 +470,9 @@ def run_dnipro_swot_node_update(**_context) -> dict[str, Any]:
     summary = {
         "run_started_from_utc": utc_text(global_start),
         "run_finished_utc": utc_text(end),
-        "node_count": len(node_ids),
+        "node_count": len(node_records),
         "status_counts": dict(counts),
+        "historical_csv_downloads": sum(result.blob_downloaded for result in results),
         "ckan_resource_updated": bool(changed),
         "collection": COLLECTION,
         "overlap_hours": overlap,
