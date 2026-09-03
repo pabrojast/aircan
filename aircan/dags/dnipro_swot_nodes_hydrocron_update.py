@@ -82,6 +82,7 @@ GEOJSON_BLOB = f"{AZURE_PREFIX}/nodes.geojson"
 LOG_BLOB = "regions/dnipro/logs/node_daily_update.csv"
 SUMMARY_BLOB = "regions/dnipro/logs/node_daily_update_summary.json"
 STATE_BLOB = "regions/dnipro/logs/node_incremental_state.json"
+PROGRESS_BLOB = "regions/dnipro/logs/node_daily_update_progress.json"
 PUBLIC_CSV_BASE = f"https://{AZURE_ACCOUNT}.blob.core.windows.net/{AZURE_CONTAINER}/{CSV_PREFIX}"
 
 DEFAULT_OVERLAP_HOURS = 48
@@ -280,6 +281,23 @@ def upload_blob(container: ContainerClient, name: str, data: bytes, content_type
     )
 
 
+def write_progress(container: ContainerClient, **values: Any) -> None:
+    """Persist best-effort run diagnostics without allowing telemetry to fail the job."""
+    payload = {
+        "updated_utc": utc_text(datetime.now(timezone.utc)),
+        **values,
+    }
+    try:
+        upload_blob(
+            container,
+            PROGRESS_BLOB,
+            json.dumps(payload, indent=2, default=str).encode("utf-8"),
+            "application/json; charset=utf-8",
+        )
+    except Exception:
+        logger.exception("Unable to write progress checkpoint to %s", PROGRESS_BLOB)
+
+
 def update_one(
     node_properties: dict[str, Any],
     container: ContainerClient,
@@ -414,7 +432,19 @@ def run_dnipro_swot_node_update(**_context) -> dict[str, Any]:
     initial = str(vget("SWOT_NODE_INITIAL_START", DEFAULT_INITIAL_START))
     global_start = parse_utc(state.get("last_successful_end_utc", initial))
     end = datetime.now(timezone.utc)
+    run_id = end.strftime("%Y%m%dT%H%M%SZ")
     logger.info("Updating %d nodes from global watermark %s to %s", len(node_records), utc_text(global_start), utc_text(end))
+    write_progress(
+        container,
+        run_id=run_id,
+        stage="processing_nodes",
+        total_nodes=len(node_records),
+        completed_nodes=0,
+        status_counts={},
+        historical_csv_downloads=0,
+        run_started_from_utc=utc_text(global_start),
+        run_target_end_utc=utc_text(end),
+    )
 
     results: list[NodeUpdate] = []
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -425,7 +455,19 @@ def run_dnipro_swot_node_update(**_context) -> dict[str, Any]:
         for completed, future in enumerate(as_completed(futures), 1):
             results.append(future.result())
             if completed % 500 == 0 or completed == len(futures):
-                logger.info("Completed %d/%d: %s", completed, len(futures), dict(Counter(r.status for r in results)))
+                progress_counts = dict(Counter(r.status for r in results))
+                logger.info("Completed %d/%d: %s", completed, len(futures), progress_counts)
+                write_progress(
+                    container,
+                    run_id=run_id,
+                    stage="processing_nodes",
+                    total_nodes=len(node_records),
+                    completed_nodes=completed,
+                    status_counts=progress_counts,
+                    historical_csv_downloads=sum(r.blob_downloaded for r in results),
+                    run_started_from_utc=utc_text(global_start),
+                    run_target_end_utc=utc_text(end),
+                )
 
     result_map = {result.node_id: result for result in results}
     for feature in features:
@@ -447,9 +489,19 @@ def run_dnipro_swot_node_update(**_context) -> dict[str, Any]:
     errors = counts["error"]
     headers = {"Authorization": ckan_key, "X-CKAN-API-Key": ckan_key}
     if changed:
+        write_progress(
+            container, run_id=run_id, stage="publishing_azure_geojson",
+            total_nodes=len(node_records), completed_nodes=len(results),
+            status_counts=dict(counts), historical_csv_downloads=sum(r.blob_downloaded for r in results),
+        )
         geometry_bytes = json.dumps(geojson, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         json.loads(geometry_bytes)
         upload_blob(container, GEOJSON_BLOB, geometry_bytes, "application/geo+json; charset=utf-8")
+        write_progress(
+            container, run_id=run_id, stage="publishing_ckan_geojson",
+            total_nodes=len(node_records), completed_nodes=len(results),
+            status_counts=dict(counts), historical_csv_downloads=sum(r.blob_downloaded for r in results),
+        )
         with tempfile.TemporaryDirectory(prefix="dnipro-node-update-") as temp_dir:
             path = Path(temp_dir) / NODE_GEOJSON_FILENAME
             path.write_bytes(geometry_bytes)
@@ -465,6 +517,11 @@ def run_dnipro_swot_node_update(**_context) -> dict[str, Any]:
             if not response.json().get("success"):
                 raise RuntimeError(response.text)
 
+    write_progress(
+        container, run_id=run_id, stage="writing_logs_and_summary",
+        total_nodes=len(node_records), completed_nodes=len(results),
+        status_counts=dict(counts), historical_csv_downloads=sum(r.blob_downloaded for r in results),
+    )
     log_frame = pd.DataFrame(asdict(result) for result in sorted(results, key=lambda item: item.node_id))
     upload_blob(container, LOG_BLOB, csv_bytes(log_frame), "text/csv; charset=utf-8")
     summary = {
@@ -479,6 +536,11 @@ def run_dnipro_swot_node_update(**_context) -> dict[str, Any]:
     }
     upload_blob(container, SUMMARY_BLOB, json.dumps(summary, indent=2).encode(), "application/json; charset=utf-8")
     if errors == 0 and not limit:
+        write_progress(
+            container, run_id=run_id, stage="advancing_watermark",
+            total_nodes=len(node_records), completed_nodes=len(results),
+            status_counts=dict(counts), historical_csv_downloads=summary["historical_csv_downloads"],
+        )
         upload_blob(
             container,
             STATE_BLOB,
@@ -487,6 +549,12 @@ def run_dnipro_swot_node_update(**_context) -> dict[str, Any]:
         )
     else:
         logger.warning("Watermark not advanced: errors=%d limit=%d", errors, limit)
+    write_progress(
+        container, run_id=run_id, stage="complete",
+        total_nodes=len(node_records), completed_nodes=len(results),
+        status_counts=dict(counts), historical_csv_downloads=summary["historical_csv_downloads"],
+        ckan_resource_updated=bool(changed), watermark_advanced=bool(errors == 0 and not limit),
+    )
     logger.info("Node update summary: %s", summary)
     return summary
 
