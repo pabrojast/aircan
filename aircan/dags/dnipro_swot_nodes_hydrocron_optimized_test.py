@@ -7,8 +7,16 @@ new Airflow Variables, and performs no writes to Azure or CKAN.
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import sys
 
 from azure.storage.blob import ContainerClient
+
+# Airflow may discover this file from a nested Git-synced DAG directory without
+# putting that directory on sys.path. Make the sibling updater import explicit.
+THIS_DAG_DIR = str(Path(__file__).resolve().parent)
+if THIS_DAG_DIR not in sys.path:
+    sys.path.insert(0, THIS_DAG_DIR)
 
 import dnipro_swot_nodes_hydrocron_update as updater
 
