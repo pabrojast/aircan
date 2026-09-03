@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
+import traceback
 
 from azure.storage.blob import ContainerClient
 
@@ -32,7 +33,7 @@ TEST_NODE_LIMIT = 1000
 TEST_WORKERS = 8
 
 
-def run_optimized_node_test(**_context):
+def _run_optimized_node_test():
     connection = str(updater.vget("AZURE_STORAGE_CONNECTION_STRING", "")).strip()
     if not connection:
         raise RuntimeError("AZURE_STORAGE_CONNECTION_STRING is required")
@@ -101,6 +102,30 @@ def run_optimized_node_test(**_context):
     }
     print(f"OPTIMIZED NODE TEST SUMMARY: {summary}")
     return summary
+
+
+def run_optimized_node_test(**_context):
+    """Return diagnostics through XCom even when test preflight fails.
+
+    This is intentionally a test-only behavior: keeping the task successful
+    preserves the diagnostic return value in Airflow's metadata database when
+    an ephemeral worker's served logs are unavailable.
+    """
+    try:
+        return _run_optimized_node_test()
+    except Exception as exc:
+        diagnostic = {
+            "test_completed": False,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+            "hint": (
+                "Confirm both optimized test and updater sibling files were "
+                "deployed from the same delivery. No production writes occurred."
+            ),
+        }
+        print(f"OPTIMIZED NODE TEST DIAGNOSTIC: {diagnostic}")
+        return diagnostic
 
 
 if DAG is not None and PythonOperator is not None:
