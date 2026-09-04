@@ -341,6 +341,22 @@ def update_one_node(
             text = (response.text or "")[:400]
             if "not found" in text.lower() and previous_count == 0:
                 return NodeResult(node_id, "not_found", query_start_utc, query_end_utc, message=text)
+            if "not found" in text.lower():
+                # Hydrocron uses HTTP 400 both for an unknown/never-observed
+                # feature and for a valid feature with no observations in the
+                # requested window. Existing historical data distinguishes the
+                # common incremental no-data case.
+                if previous_count == 0:
+                    return NodeResult(
+                        node_id, "not_found", query_start_utc, query_end_utc,
+                        final_rows=0, message=text,
+                    )
+                return NodeResult(
+                    node_id, "success_no_data", query_start_utc, query_end_utc,
+                    previous_rows=previous_count, final_rows=previous_count,
+                    first_observation_utc=previous_first,
+                    latest_observation_utc=previous_latest, message=text,
+                )
             return NodeResult(node_id, "retryable_failure", query_start_utc, query_end_utc, message=text)
         response.raise_for_status()
         raw = response_frame(response.text)
