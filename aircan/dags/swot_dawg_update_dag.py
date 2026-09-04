@@ -18,7 +18,7 @@ from swot_dawg_update import update_dawg_reference
 
 @dag(
     dag_id="swot_dawg_update", schedule_interval="0 6 * * 0",
-    start_date=datetime(2026, 9, 6), catchup=False, max_active_runs=1,
+    start_date=datetime(2026, 9, 4), catchup=False, max_active_runs=1,
     default_args={"owner": "airflow", "retries": 1, "retry_delay": timedelta(minutes=30)},
     tags=["swot", "dawg", "earthdata", "azure", "unesco"],
 )
