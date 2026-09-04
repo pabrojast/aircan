@@ -11,20 +11,78 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 import netCDF4 as nc
+import requests
 from azure.core.exceptions import ResourceNotFoundError
 from azure.storage.blob import ContainerClient, ContentSettings
-
-from find_dawg_product import CONTINENTS, discover_dawg_granule, download_with_earthaccess
-
 
 AZURE_ACCOUNT = "ihpwinsdata"
 AZURE_CONTAINER = "swot"
 PREFIX = "reference/dawg/v3"
 CURRENT_BLOB = "reference/dawg/current.json"
+CONTINENTS = {"AF", "AS", "EU", "NA", "OC", "SA"}
+SHORT_NAME = "SWOT_L4_HR_DAWG_SOS_DISCHARGE_V3"
+COLLECTION_CONCEPT_ID = "C3905028734-POCLOUD"
+CMR_GRANULES_URL = "https://cmr.earthdata.nasa.gov/search/granules.json"
+DATA_REL = "http://esipfed.org/ns/fedsearch/1.1/data#"
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def discover_dawg_granule(continent: str, timeout: int = 60) -> dict[str, Any]:
+    """Discover the latest exact continental Version 3 granule through CMR."""
+    continent = continent.strip().upper()
+    if continent not in CONTINENTS:
+        raise ValueError(f"continent must be one of {sorted(CONTINENTS)}")
+    response = requests.get(
+        CMR_GRANULES_URL,
+        params={"collection_concept_id": COLLECTION_CONCEPT_ID, "page_size": 100,
+                "sort_key[]": "-revision_date"},
+        headers={"Client-Id": "UNESCO-IHP-WINS-SWOT"}, timeout=timeout,
+    )
+    response.raise_for_status()
+    prefix = continent.lower() + "_"
+    entries = response.json().get("feed", {}).get("entry", [])
+    matches = [item for item in entries if str(item.get("title", "")).lower().startswith(prefix)]
+    if not matches:
+        raise LookupError(f"No {SHORT_NAME} granule found for {continent}")
+    selected = max(matches, key=lambda item: str(item.get("updated", "")))
+    links = [str(link.get("href", "")) for link in selected.get("links", [])
+             if link.get("rel") == DATA_REL and not link.get("inherited")
+             and str(link.get("href", "")).lower().endswith(".nc")]
+    if len(links) != 1:
+        raise RuntimeError(f"Expected one NetCDF link for {selected.get('title')}; found {len(links)}")
+    title = str(selected["title"])
+    return {"schema_version": 1, "discovered_utc": utc_now(), "short_name": SHORT_NAME,
+            "collection_concept_id": COLLECTION_CONCEPT_ID, "collection_version": "3",
+            "continent": continent, "granule_concept_id": selected.get("id"),
+            "granule_ur": title, "filename": title + ".nc", "data_url": links[0],
+            "time_start": selected.get("time_start"), "time_end": selected.get("time_end"),
+            "cmr_updated": selected.get("updated"), "dawg_sword_version": "v16"}
+
+
+def download_with_earthaccess(metadata: dict[str, Any], output_directory: Path) -> Path:
+    """Authenticate from environment and download one exact CMR granule."""
+    try:
+        import earthaccess
+    except ImportError as exc:
+        raise RuntimeError("DAWG download requires the earthaccess package") from exc
+    earthaccess.login(strategy="environment")
+    matches = earthaccess.search_data(
+        short_name=metadata["short_name"], granule_name=metadata["granule_ur"], count=20
+    )
+    matches = [item for item in matches if item["meta"]["native-id"] == metadata["granule_ur"]]
+    if len(matches) != 1:
+        raise RuntimeError(f"Earthaccess returned {len(matches)} exact granule matches")
+    output_directory.mkdir(parents=True, exist_ok=True)
+    paths = earthaccess.download(matches, local_path=str(output_directory))
+    if len(paths) != 1:
+        raise RuntimeError(f"Expected one downloaded DAWG file; received {len(paths)}")
+    path = Path(paths[0]).resolve()
+    if not path.is_file() or path.stat().st_size == 0:
+        raise RuntimeError(f"DAWG download is missing or empty: {path}")
+    return path
 
 
 def runtime_secret(name: str) -> str:
@@ -161,7 +219,7 @@ def update_dawg_reference(
         with tempfile.TemporaryDirectory(prefix="swot_dawg_") as temporary:
             root = Path(temporary)
             for continent in changed:
-                path = download_with_earthaccess(discovered[continent], root / continent.lower(), "environment")
+                path = download_with_earthaccess(discovered[continent], root / continent.lower())
                 try:
                     validation = validate_dawg(path)
                     next_continents[continent] = {
