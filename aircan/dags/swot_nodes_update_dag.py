@@ -16,7 +16,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from airflow.decorators import dag, task
 from airflow.models import Variable
 
-from swot_nodes_update import discover_node_regions, summarize_node_regions, update_node_region
+from swot_nodes_update import discover_node_regions, update_node_region
 
 
 def setting(name: str, default: str) -> str:
@@ -51,13 +51,8 @@ def swot_nodes_update():
             request_workers=int(setting("SWOT_NODE_REQUEST_WORKERS", "4")),
         )
 
-    @task
-    def summarize(result_values: list[dict]) -> dict:
-        return summarize_node_regions(result_values)
-
     regions = discover()
-    results = update_region.expand(region=regions)
-    summarize(results)
+    update_region.expand(region=regions)
 
 
 dag = swot_nodes_update()
