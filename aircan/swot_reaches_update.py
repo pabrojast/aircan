@@ -185,6 +185,7 @@ def update_reach_region(
     geometry_blob = str(reaches.get("geometry_blob") or f"regions/{region_id}/reaches/reaches.geojson")
     geometry = load_json(container, geometry_blob)
     state_blob = f"regions/{region_id}/state/reach_update.json"
+    diagnostic_blob = f"regions/{region_id}/logs/reach_update_diagnostic_latest.json"
     state = load_json(container, state_blob) or {}
     historical = manifest.get("historical_summary") or {}
     watermark = str(state.get("last_successful_end_utc") or (historical.get("window") or {}).get("end") or "2023-03-30T00:00:00Z")
@@ -204,6 +205,10 @@ def update_reach_region(
         blob_by_id[reach_id] = blob
         records.append((reach_id, props, blob))
     records.sort(key=lambda item: (0 if item[0] in retry_map else 1, item[0]))
+    upload_json(container, diagnostic_blob, {
+        "region_id": region_id, "phase": "querying_hydrocron", "run_end_utc": end_text,
+        "reach_count": len(records), "updated_utc": utc_text(utc_now()),
+    })
     results = []
     for offset in range(0, len(records), batch_size):
         with ThreadPoolExecutor(max_workers=request_workers) as executor:
@@ -214,6 +219,13 @@ def update_reach_region(
                                                blob=blob, query_start_utc=start, query_end_utc=end_text,
                                                timeout=timeout, retries=retries))
             results.extend(future.result() for future in as_completed(futures))
+        upload_json(container, diagnostic_blob, {
+            "region_id": region_id, "phase": "querying_hydrocron",
+            "run_end_utc": end_text, "completed_reaches": len(results),
+            "reach_count": len(records),
+            "status_counts": dict(Counter(item.status for item in results)),
+            "updated_utc": utc_text(utc_now()),
+        })
     by_id = {item.reach_id: item for item in results}
     geometry_changed = False
     for feature in geometry["features"]:
@@ -228,11 +240,35 @@ def update_reach_region(
         if result.final_rows:
             props["url"] = f"https://{AZURE_ACCOUNT}.blob.core.windows.net/{AZURE_CONTAINER}/{blob_by_id[result.reach_id]}"
         geometry_changed |= before != (props.get("observation_count"), props.get("latest_observation_utc"), props.get("url"))
+    run_id = f"{end.strftime('%Y%m%dT%H%M%SZ')}-{region_id}"
+    # Persist per-reach diagnostics before publication, because CKAN failures
+    # must remain debuggable even when the Airflow pod logs are unavailable.
+    upload_bytes(container, f"regions/{region_id}/logs/reach_updates/{run_id}.csv",
+                 csv_bytes(pd.DataFrame(asdict(item) for item in results)), "text/csv; charset=utf-8")
     if geometry_changed:
         encoded = json.dumps(geometry, separators=(",", ":")).encode("utf-8")
         resource_id = reach_resource_id(manifest)
         if resource_id:
-            update_ckan_resource(resource_id, encoded, f"{region_id}_sword_reaches_version_d.geojson", 180)
+            upload_json(container, diagnostic_blob, {
+                "region_id": region_id, "phase": "publishing_ckan",
+                "run_end_utc": end_text, "resource_id": resource_id,
+                "updated_utc": utc_text(utc_now()),
+            })
+            try:
+                update_ckan_resource(resource_id, encoded, f"{region_id}_sword_reaches_version_d.geojson", 180)
+            except Exception as exc:
+                upload_json(container, diagnostic_blob, {
+                    "region_id": region_id, "phase": "failed_publishing_ckan",
+                    "run_end_utc": end_text, "resource_id": resource_id,
+                    "error_type": type(exc).__name__, "error": str(exc)[:2000],
+                    "updated_utc": utc_text(utc_now()),
+                })
+                raise
+        upload_json(container, diagnostic_blob, {
+            "region_id": region_id, "phase": "publishing_azure_geojson",
+            "run_end_utc": end_text, "geometry_blob": geometry_blob,
+            "updated_utc": utc_text(utc_now()),
+        })
         upload_bytes(container, geometry_blob, encoded, "application/geo+json; charset=utf-8")
     retry = []
     for result in results:
@@ -242,9 +278,6 @@ def update_reach_region(
                           "query_start_utc": prior.get("query_start_utc") or result.query_start_utc,
                           "consecutive_failures": int(prior.get("consecutive_failures") or 0) + 1,
                           "last_error": result.message, "last_attempt_utc": end_text})
-    run_id = f"{end.strftime('%Y%m%dT%H%M%SZ')}-{region_id}"
-    upload_bytes(container, f"regions/{region_id}/logs/reach_updates/{run_id}.csv",
-                 csv_bytes(pd.DataFrame(asdict(item) for item in results)), "text/csv; charset=utf-8")
     current_dawg = load_json(container, "reference/dawg/current.json") or {}
     summary = {"schema_version": 1, "region_id": region_id, "run_id": run_id,
                "previous_watermark_utc": watermark, "run_end_utc": end_text,
@@ -261,4 +294,9 @@ def update_reach_region(
                                       "last_successful_end_utc": end_text,
                                       "updated_utc": utc_text(utc_now()), "last_run_id": run_id,
                                       "retry_reaches": retry})
+    upload_json(container, diagnostic_blob, {
+        "region_id": region_id, "phase": "complete", "run_id": run_id,
+        "run_end_utc": end_text, "status_counts": summary["status_counts"],
+        "retry_queue_size": len(retry), "updated_utc": utc_text(utc_now()),
+    })
     return summary
