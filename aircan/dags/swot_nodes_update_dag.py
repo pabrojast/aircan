@@ -2,7 +2,16 @@
 
 from __future__ import annotations
 
+import sys
 from datetime import datetime, timedelta
+from pathlib import Path
+
+# Airflow loads this file from ``aircan/dags`` but this repository's shared
+# updater module lives at ``aircan/swot_nodes_update.py``. Some deployments do
+# not place the repository root on sys.path automatically.
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from airflow.decorators import dag, task
 from airflow.models import Variable
