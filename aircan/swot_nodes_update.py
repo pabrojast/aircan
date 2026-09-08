@@ -1,9 +1,8 @@
-"""Simple global incremental updater for all registered Azure SWOT nodes.
+"""Regional node updater using the same lifecycle as the reach updater.
 
-One Airflow DAG discovers all regions. One bounded Airflow task updates each
-region, processing ordinary in-process batches. Recovery uses a regional
-watermark plus a compact failed-node queue that preserves the original query
-start for failures lasting longer than the normal overlap.
+Each node uses its own latest observation as its incremental watermark. Node
+CSVs are merged first, then one regional GeoJSON payload is published to CKAN
+and Azure at the end of a run when its feature metadata changed.
 """
 
 from __future__ import annotations
@@ -273,6 +272,62 @@ def node_resource_id(manifest: dict[str, Any]) -> str | None:
     return ckan.get("node_resource_id") or ckan.get("nod_resource_id")
 
 
+def ensure_node_ckan_resource(
+    *, dataset_id: str, resource_name: str, geometry: bytes, filename: str,
+    api_key: str, timeout: int = 300,
+) -> tuple[str, bool]:
+    """Reuse an exact named node resource or create it once in the target dataset."""
+    session = requests.Session()
+    session.headers.update({"Authorization": api_key, "X-CKAN-API-Key": api_key})
+    package_response = session.post(
+        f"{CKAN_BASE}/api/3/action/package_show",
+        data={"id": dataset_id}, timeout=min(timeout, 60),
+    )
+    if not package_response.ok:
+        raise RuntimeError(
+            f"Cannot inspect CKAN dataset {dataset_id}: HTTP "
+            f"{package_response.status_code}: {package_response.text[:2000]}"
+        )
+    package = package_response.json()
+    if not package.get("success"):
+        raise RuntimeError(package_response.text[:2000])
+    matches = [
+        item for item in (package.get("result") or {}).get("resources", [])
+        if str(item.get("name", "")).strip().casefold() == resource_name.casefold()
+    ]
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"Duplicate CKAN node resources named {resource_name!r}: "
+            f"{[item.get('id') for item in matches]}"
+        )
+    if matches:
+        return str(matches[0]["id"]), False
+
+    create_response = session.post(
+        f"{CKAN_BASE}/api/3/action/resource_create",
+        data={
+            "package_id": (package.get("result") or {}).get("id") or dataset_id,
+            "name": resource_name,
+            "description": (
+                "SWORD v17b river nodes linked to quality-filtered SWOT "
+                "RiverSP Version D water-surface-elevation and width time series."
+            ),
+            "format": "GeoJSON",
+        },
+        files={"upload": (filename, io.BytesIO(geometry), "application/geo+json")},
+        timeout=timeout,
+    )
+    if not create_response.ok:
+        raise RuntimeError(
+            f"Cannot create CKAN node resource: HTTP {create_response.status_code}: "
+            f"{create_response.text[:2000]}"
+        )
+    created = create_response.json()
+    if not created.get("success") or not (created.get("result") or {}).get("id"):
+        raise RuntimeError(create_response.text[:2000])
+    return str(created["result"]["id"]), True
+
+
 def discover_node_regions(
     connection_string_env: str = "AZURE_STORAGE_CONNECTION_STRING",
     region_filter: str | None = None,
@@ -317,16 +372,19 @@ def bootstrap_watermark(
 
 def query_start_for_node(
     node_id: str, regional_watermark: str, retry_map: dict[str, dict[str, Any]],
-    overlap_hours: int, source_lag_hours: int = 0,
+    overlap_hours: int, latest_observation_utc: str | None = None,
 ) -> str:
     retry = retry_map.get(node_id)
     if retry and retry.get("query_start_utc"):
         return str(retry["query_start_utc"])
-    # SWOT observations can appear in Hydrocron several days after their
-    # observation timestamp. A processing watermark with only a short overlap
-    # permanently skips those late arrivals once the watermark advances.
-    lookback_hours = max(overlap_hours, source_lag_hours)
-    return utc_text(parse_utc(regional_watermark) - timedelta(hours=lookback_hours))
+    try:
+        latest = parse_utc(latest_observation_utc) if latest_observation_utc else None
+    except (TypeError, ValueError):
+        latest = None
+    # Match the working node implementation: an old node keeps querying from
+    # its own old observation, even after the regional run watermark advances.
+    start = latest or parse_utc(regional_watermark)
+    return utc_text(start - timedelta(hours=overlap_hours))
 
 
 def update_one_node(
@@ -372,24 +430,6 @@ def update_one_node(
                 node_id, "success_no_data", query_start_utc, query_end_utc,
                 input_rows=len(raw), previous_rows=previous_count, final_rows=previous_count,
                 first_observation_utc=previous_first, latest_observation_utc=previous_latest,
-            )
-        incoming_first, incoming_latest = observation_bounds(incoming)
-        if (
-            previous_latest
-            and incoming_latest
-            and parse_utc(incoming_latest) <= parse_utc(previous_latest)
-        ):
-            # The extended source-lag window intentionally rediscovers recent
-            # observations. Avoid downloading and rewriting the historical CSV
-            # unless Hydrocron contains an observation newer than the map's
-            # recorded latest timestamp.
-            return NodeResult(
-                node_id, "success_no_data", query_start_utc, query_end_utc,
-                input_rows=len(raw), accepted_rows=len(incoming),
-                previous_rows=previous_count, final_rows=previous_count,
-                first_observation_utc=previous_first,
-                latest_observation_utc=previous_latest,
-                message=f"No observation newer than {previous_latest}",
             )
         previous_bytes = download_blob(container, blob)
         if previous_bytes is None and previous_count > 0:
@@ -450,7 +490,8 @@ def update_node_region(
     *, region: dict[str, str], connection_string_env: str = "AZURE_STORAGE_CONNECTION_STRING",
     overlap_hours: int = 48, batch_size: int = 750, request_workers: int = 4,
     timeout: int = 60, retries: int = 5, run_end_utc: str | None = None,
-    ckan_timeout: int = 180, source_lag_hours: int = 336,
+    ckan_timeout: int = 180,
+    ckan_api_key: str | None = None,
 ) -> dict[str, Any]:
     """Update every node in one region using internal, sequential batches."""
     if not 1 <= batch_size <= 5000:
@@ -467,6 +508,9 @@ def update_node_region(
     geometry = load_json(container, geometry_blob)
     if not geometry or not isinstance(geometry.get("features"), list):
         raise RuntimeError(f"Invalid node GeoJSON for {region_id}")
+    ckan = manifest.get("ckan") or {}
+    dataset_id = str(ckan.get("dataset_id") or "").strip()
+    resource_created = False
     state_name = f"regions/{region_id}/state/node_update.json"
     state = load_json(container, state_name) or {}
     watermark = str(state.get("last_successful_end_utc") or bootstrap_watermark(container, region_id, manifest))
@@ -502,7 +546,8 @@ def update_node_region(
                 update_one_node,
                 container=container, node_properties=props, blob=blob,
                 query_start_utc=query_start_for_node(
-                    node_id, watermark, retry_map, overlap_hours, source_lag_hours
+                    node_id, watermark, retry_map, overlap_hours,
+                    props.get("latest_observation_utc"),
                 ),
                 query_end_utc=end_text, timeout=timeout, retries=retries,
             ) for node_id, props, blob in batch]
@@ -518,24 +563,62 @@ def update_node_region(
         result = by_id.get(clean_id(props.get("node_id", "")))
         if not result or result.status not in {"success_with_data", "success_no_data", "not_found"}:
             continue
-        if result.status == "success_with_data":
-            before = (props.get("observation_count"), props.get("latest_observation_utc"), props.get("url"))
-            props["observation_count"] = result.final_rows
-            props["has_data"] = result.final_rows > 0
-            props["first_observation_utc"] = result.first_observation_utc or None
-            props["latest_observation_utc"] = result.latest_observation_utc or None
-            if result.final_rows:
-                props["url"] = (
-                    f"https://{AZURE_ACCOUNT}.blob.core.windows.net/{AZURE_CONTAINER}/"
-                    f"{blob_by_id[result.node_id]}"
-                )
-            after = (props.get("observation_count"), props.get("latest_observation_utc"), props.get("url"))
-            geometry_changed |= before != after
+        before = (
+            props.get("observation_count"), props.get("has_data"),
+            props.get("first_observation_utc"), props.get("latest_observation_utc"),
+            props.get("url"),
+        )
+        props["observation_count"] = result.final_rows
+        props["has_data"] = result.final_rows > 0
+        props["first_observation_utc"] = result.first_observation_utc or None
+        props["latest_observation_utc"] = result.latest_observation_utc or None
+        if result.final_rows:
+            props["url"] = (
+                f"https://{AZURE_ACCOUNT}.blob.core.windows.net/{AZURE_CONTAINER}/"
+                f"{blob_by_id[result.node_id]}"
+            )
+        else:
+            props.pop("url", None)
+        after = (
+            props.get("observation_count"), props.get("has_data"),
+            props.get("first_observation_utc"), props.get("latest_observation_utc"),
+            props.get("url"),
+        )
+        geometry_changed |= before != after
 
     if geometry_changed:
         geometry_bytes = json.dumps(geometry, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         resource_id = node_resource_id(manifest)
-        if resource_id:
+        # Node resources are provisioned lazily because historical manifests
+        # may predate the node product. Unchanged runs do not need CKAN at all.
+        resource_verified = str(ckan.get("node_resource_dataset_id") or "") == dataset_id
+        if dataset_id and (not resource_id or not resource_verified):
+            api_key = (ckan_api_key or "").strip() or runtime_secret("CKAN_API_KEY")
+            if not api_key:
+                api_key = runtime_secret("IHP_WINS_CKAN_API_KEY")
+            if not api_key:
+                raise RuntimeError("CKAN_API_KEY is required to publish the changed node GeoJSON")
+            resource_name = str(
+                ckan.get("node_resource_name")
+                or f"{manifest.get('display_name') or region_id} SWOT-SWORD Nodes (Version D)"
+            )
+            provisioned_id, resource_created = ensure_node_ckan_resource(
+                dataset_id=dataset_id, resource_name=resource_name,
+                geometry=geometry_bytes,
+                filename=f"{region_id}_sword_nodes_version_d.geojson",
+                api_key=api_key, timeout=max(ckan_timeout, 300),
+            )
+            if resource_id and resource_id != provisioned_id:
+                ckan["legacy_node_resource_id"] = resource_id
+            ckan["node_resource_id"] = provisioned_id
+            ckan["node_resource_dataset_id"] = dataset_id
+            ckan.pop("nod_resource_id", None)
+            manifest["ckan"] = ckan
+            upload_json(container, region["manifest_blob"], manifest)
+            resource_id = provisioned_id
+        if not resource_id:
+            raise RuntimeError(f"Missing node_resource_id and dataset_id for {region_id}")
+        if not resource_created:
             update_ckan_resource(resource_id, geometry_bytes, f"{region_id}_sword_nodes_version_d.geojson", ckan_timeout)
         # Azure GeoJSON is the commit immediately after CKAN succeeds. If CKAN
         # fails, the old geometry remains and the next run can safely retry it.
@@ -566,10 +649,10 @@ def update_node_region(
         "node_count": len(records), "batch_size": batch_size,
         "batch_count": (len(records) + batch_size - 1) // batch_size,
         "request_workers": request_workers, "overlap_hours": overlap_hours,
-        "source_lag_hours": source_lag_hours,
         "status_counts": dict(counts), "changed_csvs": sum(item.blob_changed for item in results),
         "retry_queue_size": len(next_retry), "geometry_updated": geometry_changed,
         "ckan_updated": bool(geometry_changed and node_resource_id(manifest)),
+        "ckan_resource_created": resource_created,
     }
     upload_json(container, f"regions/{region_id}/logs/node_update_latest.json", summary)
     # The state is the final commit marker. Failed nodes retain their original
