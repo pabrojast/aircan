@@ -407,9 +407,17 @@ def update_ckan_resource(resource_id: str, geometry: bytes, filename: str, timeo
         files={"upload": (filename, io.BytesIO(geometry), "application/geo+json")},
         timeout=timeout,
     )
-    response.raise_for_status()
-    if not response.json().get("success"):
-        raise RuntimeError(response.text)
+    if not response.ok:
+        detail = (response.text or "").strip().replace("\x00", "")[:2000]
+        raise RuntimeError(
+            f"CKAN resource_update failed with HTTP {response.status_code}: {detail or '<empty response>'}"
+        )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"CKAN resource_update returned invalid JSON: {response.text[:1000]}") from exc
+    if not payload.get("success"):
+        raise RuntimeError(response.text[:2000])
 
 
 def update_node_region(
