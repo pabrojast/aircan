@@ -602,40 +602,41 @@ def update_node_region(
 
     if geometry_changed:
         geometry_bytes = json.dumps(geometry, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        resource_id = node_resource_id(manifest)
-        # Node resources are provisioned lazily because historical manifests
-        # may predate the node product. Unchanged runs do not need CKAN at all.
-        resource_verified = str(ckan.get("node_resource_dataset_id") or "") == dataset_id
-        if dataset_id and (not resource_id or not resource_verified):
-            api_key = (ckan_api_key or "").strip() or runtime_secret("CKAN_API_KEY")
-            if not api_key:
-                api_key = runtime_secret("IHP_WINS_CKAN_API_KEY")
-            if not api_key:
-                raise RuntimeError("CKAN_API_KEY is required to publish the changed node GeoJSON")
-            resource_name = str(
-                ckan.get("node_resource_name")
-                or f"{manifest.get('display_name') or region_id} SWOT-SWORD Nodes (Version D)"
-            )
-            provisioned_id, resource_created = ensure_node_ckan_resource(
-                dataset_id=dataset_id, resource_name=resource_name,
-                geometry=geometry_bytes,
-                filename=f"{region_id}_sword_nodes_version_d.geojson",
-                api_key=api_key, timeout=max(ckan_timeout, 300),
-            )
-            if resource_id and resource_id != provisioned_id:
-                ckan["legacy_node_resource_id"] = resource_id
-            ckan["node_resource_id"] = provisioned_id
-            ckan["node_resource_dataset_id"] = dataset_id
-            ckan.pop("nod_resource_id", None)
-            manifest["ckan"] = ckan
-            upload_json(container, region["manifest_blob"], manifest)
-            resource_id = provisioned_id
-        if not resource_id:
-            raise RuntimeError(f"Missing node_resource_id and dataset_id for {region_id}")
-        if not resource_created:
-            update_ckan_resource(resource_id, geometry_bytes, f"{region_id}_sword_nodes_version_d.geojson", ckan_timeout)
-        # Azure GeoJSON is the commit immediately after CKAN succeeds. If CKAN
-        # fails, the old geometry remains and the next run can safely retry it.
+        if nodes.get("publication_mode") != "azure_url":
+            resource_id = node_resource_id(manifest)
+            # Node resources are provisioned lazily because historical manifests
+            # may predate the node product. Unchanged runs do not need CKAN at all.
+            resource_verified = str(ckan.get("node_resource_dataset_id") or "") == dataset_id
+            if dataset_id and (not resource_id or not resource_verified):
+                api_key = (ckan_api_key or "").strip() or runtime_secret("CKAN_API_KEY")
+                if not api_key:
+                    api_key = runtime_secret("IHP_WINS_CKAN_API_KEY")
+                if not api_key:
+                    raise RuntimeError("CKAN_API_KEY is required to publish the changed node GeoJSON")
+                resource_name = str(
+                    ckan.get("node_resource_name")
+                    or f"{manifest.get('display_name') or region_id} SWOT-SWORD Nodes (Version D)"
+                )
+                provisioned_id, resource_created = ensure_node_ckan_resource(
+                    dataset_id=dataset_id, resource_name=resource_name,
+                    geometry=geometry_bytes,
+                    filename=f"{region_id}_sword_nodes_version_d.geojson",
+                    api_key=api_key, timeout=max(ckan_timeout, 300),
+                )
+                if resource_id and resource_id != provisioned_id:
+                    ckan["legacy_node_resource_id"] = resource_id
+                ckan["node_resource_id"] = provisioned_id
+                ckan["node_resource_dataset_id"] = dataset_id
+                ckan.pop("nod_resource_id", None)
+                manifest["ckan"] = ckan
+                upload_json(container, region["manifest_blob"], manifest)
+                resource_id = provisioned_id
+            if not resource_id:
+                raise RuntimeError(f"Missing node_resource_id and dataset_id for {region_id}")
+            if not resource_created:
+                update_ckan_resource(resource_id, geometry_bytes, f"{region_id}_sword_nodes_version_d.geojson", ckan_timeout)
+            # Azure GeoJSON is the commit immediately after CKAN succeeds. If CKAN
+            # fails, the old geometry remains and the next run can safely retry it.
         upload_bytes(container, geometry_blob, geometry_bytes, "application/geo+json; charset=utf-8")
 
     next_retry = []
@@ -665,7 +666,7 @@ def update_node_region(
         "request_workers": request_workers, "overlap_hours": overlap_hours,
         "status_counts": dict(counts), "changed_csvs": sum(item.blob_changed for item in results),
         "retry_queue_size": len(next_retry), "geometry_updated": geometry_changed,
-        "ckan_updated": bool(geometry_changed and node_resource_id(manifest)),
+        "ckan_updated": bool(geometry_changed and node_resource_id(manifest) and nodes.get("publication_mode") != "azure_url"),
         "ckan_resource_created": resource_created,
     }
     upload_json(container, f"regions/{region_id}/logs/node_update_latest.json", summary)
