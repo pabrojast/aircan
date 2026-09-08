@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import io
 import os
+import hashlib
 import random
 import time
 from collections import Counter
@@ -78,19 +79,133 @@ def reach_resource_id(manifest: dict[str, Any]) -> str | None:
     return (manifest.get("ckan") or {}).get("reach_resource_id")
 
 
-def publish_reach_geojson(
-    resource_id: str, geometry: bytes, filename: str, timeout: int,
-    api_key: str | None = None,
-) -> None:
-    """Publish exactly like the proven standalone Dnipro reach publisher."""
+def resolve_reach_ckan_key(api_key: str | None = None) -> str:
     key = (api_key or "").strip()
     if not key:
         key = (
             os.environ.get("CKAN_API_KEY", "").strip()
             or os.environ.get("IHP_WINS_CKAN_API_KEY", "").strip()
         )
+    # Tolerate common Airflow Variable entry mistakes without changing the
+    # actual token: JSON/string quotes and an HTTP-style Bearer prefix.
+    if len(key) >= 2 and key[0] == key[-1] and key[0] in {'"', "'"}:
+        key = key[1:-1].strip()
+    if key.lower().startswith("bearer "):
+        key = key[7:].strip()
     if not key:
         raise RuntimeError("CKAN_API_KEY is required when reach GeoJSON changes")
+    return key
+
+
+def ckan_key_fingerprint(api_key: str) -> str:
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
+
+
+def validate_reach_ckan_key(api_key: str, timeout: int = 30) -> None:
+    """Fail fast unless CKAN recognizes the token as an authenticated user."""
+    session = requests.Session()
+    session.headers.update({"Authorization": api_key, "X-CKAN-API-Key": api_key})
+    response = session.post(
+        "https://ihp-wins.unesco.org/api/3/action/dashboard_activity_list",
+        data={"limit": 1}, timeout=timeout,
+    )
+    if not response.ok:
+        detail = (response.text or "").strip().replace("\x00", "")[:2000]
+        raise RuntimeError(
+            f"CKAN did not recognize the configured API token (HTTP "
+            f"{response.status_code}, fingerprint={ckan_key_fingerprint(api_key)}, "
+            f"length={len(api_key)}): {detail or '<empty response>'}"
+        )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError("CKAN credential check returned invalid JSON") from exc
+    if not payload.get("success"):
+        raise RuntimeError(
+            f"CKAN credential check failed (fingerprint={ckan_key_fingerprint(api_key)}): "
+            f"{response.text[:2000]}"
+        )
+
+
+def load_ckan_reach_geojson(resource_id: str, api_key: str, timeout: int = 180) -> dict[str, Any]:
+    """Read the existing private target so replacement cannot change its contract."""
+    session = requests.Session()
+    session.headers.update({"Authorization": api_key, "X-CKAN-API-Key": api_key})
+    metadata_response = session.post(
+        "https://ihp-wins.unesco.org/api/3/action/resource_show",
+        data={"id": resource_id}, timeout=min(timeout, 30),
+    )
+    if not metadata_response.ok:
+        raise RuntimeError(
+            f"Cannot read target CKAN resource {resource_id}: "
+            f"HTTP {metadata_response.status_code}: {metadata_response.text[:2000]}"
+        )
+    metadata = metadata_response.json()
+    if not metadata.get("success") or not (metadata.get("result") or {}).get("url"):
+        raise RuntimeError(f"Invalid CKAN resource metadata: {metadata_response.text[:2000]}")
+    download_response = session.get(metadata["result"]["url"], timeout=timeout)
+    if not download_response.ok:
+        raise RuntimeError(
+            f"Cannot download target CKAN GeoJSON {resource_id}: "
+            f"HTTP {download_response.status_code}: {download_response.text[:1000]}"
+        )
+    try:
+        payload = download_response.json()
+    except ValueError as exc:
+        raise RuntimeError("Target CKAN resource is not valid JSON") from exc
+    if payload.get("type") != "FeatureCollection" or not isinstance(payload.get("features"), list):
+        raise RuntimeError("Target CKAN resource is not a GeoJSON FeatureCollection")
+    return payload
+
+
+def geojson_property_columns(payload: dict[str, Any]) -> list[str]:
+    columns: list[str] = []
+    seen: set[str] = set()
+    for feature in payload.get("features", []):
+        for column in (feature.get("properties") or {}):
+            if column not in seen:
+                seen.add(column)
+                columns.append(column)
+    return columns
+
+
+def validate_reach_geojson_contract(
+    target: dict[str, Any], candidate: dict[str, Any]
+) -> dict[str, Any]:
+    target_columns = geojson_property_columns(target)
+    candidate_columns = geojson_property_columns(candidate)
+    target_ids = {
+        clean_id((feature.get("properties") or {}).get("reach_id", ""))
+        for feature in target.get("features", [])
+    } - {""}
+    candidate_ids = {
+        clean_id((feature.get("properties") or {}).get("reach_id", ""))
+        for feature in candidate.get("features", [])
+    } - {""}
+    missing_columns = [item for item in target_columns if item not in candidate_columns]
+    extra_columns = [item for item in candidate_columns if item not in target_columns]
+    missing_ids = sorted(target_ids - candidate_ids)
+    extra_ids = sorted(candidate_ids - target_ids)
+    if missing_columns or extra_columns or missing_ids or extra_ids:
+        raise RuntimeError(
+            "Candidate GeoJSON does not match the private CKAN resource contract: "
+            f"missing_columns={missing_columns}, extra_columns={extra_columns}, "
+            f"missing_reach_ids={missing_ids[:20]} (count={len(missing_ids)}), "
+            f"extra_reach_ids={extra_ids[:20]} (count={len(extra_ids)})"
+        )
+    return {
+        "columns": target_columns,
+        "column_count": len(target_columns),
+        "reach_count": len(target_ids),
+    }
+
+
+def publish_reach_geojson(
+    resource_id: str, geometry: bytes, filename: str, timeout: int,
+    api_key: str | None = None,
+) -> None:
+    """Publish exactly like the proven standalone Dnipro reach publisher."""
+    key = resolve_reach_ckan_key(api_key)
 
     session = requests.Session()
     session.headers.update({"Authorization": key, "X-CKAN-API-Key": key})
@@ -228,6 +343,39 @@ def update_reach_region(
     geometry = load_json(container, geometry_blob)
     state_blob = f"regions/{region_id}/state/reach_update.json"
     diagnostic_blob = f"regions/{region_id}/logs/reach_update_diagnostic_latest.json"
+    resource_id = reach_resource_id(manifest)
+    resolved_ckan_key = None
+    if resource_id:
+        resolved_ckan_key = resolve_reach_ckan_key(ckan_api_key)
+        upload_json(container, diagnostic_blob, {
+            "region_id": region_id, "phase": "validating_ckan_credentials",
+            "resource_id": resource_id,
+            "credential_fingerprint": ckan_key_fingerprint(resolved_ckan_key),
+            "credential_length": len(resolved_ckan_key),
+            "updated_utc": utc_text(utc_now()),
+        })
+        try:
+            validate_reach_ckan_key(resolved_ckan_key, min(timeout, 30))
+            target_geometry = load_ckan_reach_geojson(
+                resource_id, resolved_ckan_key, ckan_timeout
+            )
+            contract = validate_reach_geojson_contract(target_geometry, geometry)
+        except Exception as exc:
+            upload_json(container, diagnostic_blob, {
+                "region_id": region_id, "phase": "failed_validating_ckan_credentials",
+                "resource_id": resource_id,
+                "credential_fingerprint": ckan_key_fingerprint(resolved_ckan_key),
+                "credential_length": len(resolved_ckan_key),
+                "error_type": type(exc).__name__, "error": str(exc)[:2000],
+                "updated_utc": utc_text(utc_now()),
+            })
+            raise
+        upload_json(container, diagnostic_blob, {
+            "region_id": region_id, "phase": "validated_ckan_contract",
+            "resource_id": resource_id,
+            "credential_fingerprint": ckan_key_fingerprint(resolved_ckan_key),
+            **contract, "updated_utc": utc_text(utc_now()),
+        })
     state = load_json(container, state_blob) or {}
     historical = manifest.get("historical_summary") or {}
     watermark = str(state.get("last_successful_end_utc") or (historical.get("window") or {}).get("end") or "2023-03-30T00:00:00Z")
@@ -289,7 +437,6 @@ def update_reach_region(
                  csv_bytes(pd.DataFrame(asdict(item) for item in results)), "text/csv; charset=utf-8")
     if geometry_changed:
         encoded = json.dumps(geometry, separators=(",", ":")).encode("utf-8")
-        resource_id = reach_resource_id(manifest)
         if resource_id:
             upload_json(container, diagnostic_blob, {
                 "region_id": region_id, "phase": "publishing_ckan",
@@ -300,7 +447,7 @@ def update_reach_region(
                 publish_reach_geojson(
                     resource_id, encoded,
                     f"{region_id}_sword_reaches_version_d.geojson",
-                    ckan_timeout, api_key=ckan_api_key,
+                    ckan_timeout, api_key=resolved_ckan_key,
                 )
             except Exception as exc:
                 upload_json(container, diagnostic_blob, {
