@@ -102,15 +102,18 @@ def safe_region(value: str) -> str:
 
 
 def runtime_secret(name: str) -> str:
-    value = os.environ.get(name, "").strip()
-    if value:
-        return value
+    # Match the proven Airflow updater: an explicitly managed Airflow Variable
+    # is authoritative. Deployment environments can contain stale placeholder
+    # values that must not shadow the current Airflow credential.
     try:
         from airflow.models import Variable
 
-        return str(Variable.get(name, default_var="")).strip()
+        value = str(Variable.get(name, default_var="")).strip()
+        if value:
+            return value
     except Exception:
-        return ""
+        pass
+    return os.environ.get(name, "").strip()
 
 
 def get_container(connection_string_env: str = "AZURE_STORAGE_CONNECTION_STRING") -> ContainerClient:
