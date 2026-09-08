@@ -214,7 +214,7 @@ def update_reach_region(
     overlap_hours: int = 48, backfill_days_if_empty: int = 2,
     batch_size: int = 500, request_workers: int = 4,
     timeout: int = 60, retries: int = 5, run_end_utc: str | None = None,
-    ckan_timeout: int = 180, **_ignored: Any,
+    ckan_timeout: int = 900, **_ignored: Any,
 ) -> dict[str, Any]:
     container = get_container(connection_string_env)
     region_id = safe_region(region["region_id"])
@@ -311,10 +311,28 @@ def update_reach_region(
             raise RuntimeError(f"Missing reach_resource_id for {region_id}")
         # Publish the identical payload once to each backend. CKAN goes first
         # so a CKAN failure leaves Azure metadata old and retryable next run.
-        update_ckan_resource(
-            resource_id, geometry_bytes,
-            f"{region_id}_sword_reaches_version_d.geojson", ckan_timeout,
-        )
+        upload_json(container, diagnostic_blob, {
+            "region_id": region_id, "phase": "publishing_ckan_geojson",
+            "run_id": run_id, "run_end_utc": end_text,
+            "resource_id": resource_id, "geojson_bytes": len(geometry_bytes),
+            "ckan_timeout_seconds": ckan_timeout,
+            "updated_utc": utc_text(utc_now()),
+        })
+        try:
+            update_ckan_resource(
+                resource_id, geometry_bytes,
+                f"{region_id}_sword_reaches_version_d.geojson", ckan_timeout,
+            )
+        except Exception as exc:
+            upload_json(container, diagnostic_blob, {
+                "region_id": region_id, "phase": "publishing_ckan_geojson_failed",
+                "run_id": run_id, "run_end_utc": end_text,
+                "resource_id": resource_id, "geojson_bytes": len(geometry_bytes),
+                "ckan_timeout_seconds": ckan_timeout,
+                "error_type": type(exc).__name__, "error": str(exc)[:4000],
+                "updated_utc": utc_text(utc_now()),
+            })
+            raise
         upload_bytes(container, geometry_blob, geometry_bytes, "application/geo+json; charset=utf-8")
         ckan_updated = True
 
