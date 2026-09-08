@@ -21,20 +21,16 @@ def swot_reaches_update():
     def discover() -> list[dict[str, str]]:
         from swot_reaches_update import discover_reach_regions
         return discover_reach_regions(region_filter=setting("SWOT_REACH_REGION_FILTER", "") or None)
-    # This task emits one final GeoJSON publication. A retry would repeat all
-    # reach queries and resend that publication within the same DAG run.
-    @task(pool="swot_hydrocron", max_active_tis_per_dag=2, retries=0)
+    @task(pool="swot_hydrocron", max_active_tis_per_dag=2)
     def update_region(region: dict[str, str]) -> dict:
         from swot_reaches_update import update_reach_region
         return update_reach_region(region=region,
             batch_size=int(setting("SWOT_REACH_BATCH_SIZE", "500")),
             overlap_hours=int(setting("SWOT_REACH_OVERLAP_HOURS", "48")),
+            backfill_days_if_empty=int(setting("SWOT_REACH_BACKFILL_DAYS_IF_EMPTY", "2")),
             timeout=int(setting("SWOT_REACH_TIMEOUT_S", "60")),
             retries=int(setting("SWOT_REACH_REQUEST_RETRIES", "5")),
-            request_workers=int(setting("SWOT_REACH_REQUEST_WORKERS", "4")),
-            ckan_api_key=(setting("CKAN_API_KEY", "")
-                          or setting("IHP_WINS_CKAN_API_KEY", "")),
-            ckan_timeout=int(setting("SWOT_REACH_CKAN_TIMEOUT_S", "180")))
+            request_workers=int(setting("SWOT_REACH_REQUEST_WORKERS", "4")))
     update_region.expand(region=discover())
 
 dag = swot_reaches_update()
