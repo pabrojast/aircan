@@ -339,8 +339,6 @@ def update_one_node(
         response = get_with_retries(params, timeout, retries)
         if response.status_code == 400:
             text = (response.text or "")[:400]
-            if "not found" in text.lower() and previous_count == 0:
-                return NodeResult(node_id, "not_found", query_start_utc, query_end_utc, message=text)
             if "not found" in text.lower():
                 # Hydrocron uses HTTP 400 both for an unknown/never-observed
                 # feature and for a valid feature with no observations in the
@@ -394,9 +392,14 @@ def update_one_node(
 
 
 def update_ckan_resource(resource_id: str, geometry: bytes, filename: str, timeout: int) -> None:
-    api_key = runtime_secret("CKAN_API_KEY")
+    # CKAN_API_KEY is the current Airflow variable used by the proven Dnipro
+    # publisher.  Keep the legacy environment/variable name as a fallback,
+    # but never let a stale legacy key shadow the current credential.
+    api_key = runtime_secret("CKAN_API_KEY") or runtime_secret("IHP_WINS_CKAN_API_KEY")
     if not api_key:
-        raise RuntimeError("CKAN_API_KEY is required when node GeoJSON changes")
+        raise RuntimeError(
+            "CKAN_API_KEY or IHP_WINS_CKAN_API_KEY is required when GeoJSON changes"
+        )
     response = requests.post(
         f"{CKAN_BASE}/api/3/action/resource_update",
         headers={"Authorization": api_key, "X-CKAN-API-Key": api_key},
