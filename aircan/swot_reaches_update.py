@@ -1,11 +1,13 @@
-"""Simple global incremental updater for all registered Azure SWOT reaches."""
+"""Regional daily SWOT reach updater modeled on the proven Dnipro DAG.
+
+The regional GeoJSON supplies reach IDs and stable CSV links. Daily runs update
+only per-reach Azure CSVs and audit/state blobs; they never replace CKAN or
+GeoJSON resources.
+"""
 
 from __future__ import annotations
 
-import json
 import io
-import os
-import hashlib
 import random
 import time
 from collections import Counter
@@ -15,49 +17,20 @@ from datetime import timedelta
 from typing import Any
 
 import pandas as pd
-import requests
+from pandas.errors import EmptyDataError
 
 from swot_nodes_update import (
-    AZURE_ACCOUNT, AZURE_CONTAINER, clean_id, csv_bytes, download_blob,
-    get_container, get_with_retries, load_json, observation_bounds,
-    parse_utc, response_frame, safe_id, safe_region,
-    upload_bytes, upload_json, utc_now, utc_text,
+    clean_id, csv_bytes, download_blob, get_container, get_with_retries,
+    load_json, observation_bounds, parse_utc, response_frame, safe_id,
+    safe_region, upload_bytes, upload_json, utc_now, utc_text,
 )
 
-REACH_FIELDS = (
-    "reach_id,time_str,cycle_id,pass_id,wse,slope,width,area_total,"
-    "dschg_gm,dschg_gm_q,reach_q,reach_q_b,river_name,crid,sword_version,"
-    "collection_shortname,collection_version,granuleUR"
-)
+REACH_FIELDS = "time_str,wse,slope,width,reach_q"
 REACH_OUTPUT_COLUMNS = [
-    "reach_id", "time_utc", "wse", "wse_units", "slope", "slope_units",
-    "width", "width_units", "area_total", "area_total_units", "dschg_gm",
-    "dschg_gm_units", "dschg_gm_q", "reach_q", "reach_q_b", "consensus_q",
-    "consensus_q_units", "cycle_id", "pass_id", "river_name", "crid",
-    "sword_version", "collection_shortname", "collection_version", "granuleUR",
+    "time_utc", "wse", "slope", "width", "reach_q",
+    "wse_units", "slope_units", "width_units", "consensus_q",
 ]
-
-
-def normalize_reaches(frame: pd.DataFrame) -> pd.DataFrame:
-    """Normalize Hydrocron reach rows while retaining the full CSV contract."""
-    if frame.empty:
-        return pd.DataFrame(columns=REACH_OUTPUT_COLUMNS)
-    if "time_str" not in frame:
-        raise ValueError("Hydrocron reach response has no time_str field")
-    output = frame.copy()
-    parsed = pd.to_datetime(output["time_str"], format="mixed", errors="coerce", utc=True)
-    output = output.loc[parsed.notna()].copy()
-    output["time_utc"] = parsed.loc[output.index].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    if "reach_id" in output:
-        output["reach_id"] = output["reach_id"].map(clean_id)
-    output["consensus_q"] = pd.NA
-    output["consensus_q_units"] = "m^3/s"
-    for column in REACH_OUTPUT_COLUMNS:
-        if column not in output:
-            output[column] = pd.NA
-    return (output[REACH_OUTPUT_COLUMNS]
-            .drop_duplicates(["reach_id", "time_utc", "cycle_id", "pass_id"], keep="last")
-            .sort_values("time_utc").reset_index(drop=True))
+FILL_VALUE_THRESHOLD = -1.0e9
 
 
 @dataclass
@@ -75,162 +48,6 @@ class ReachResult:
     message: str = ""
 
 
-def reach_resource_id(manifest: dict[str, Any]) -> str | None:
-    return (manifest.get("ckan") or {}).get("reach_resource_id")
-
-
-def resolve_reach_ckan_key(api_key: str | None = None) -> str:
-    key = (api_key or "").strip()
-    if not key:
-        key = (
-            os.environ.get("CKAN_API_KEY", "").strip()
-            or os.environ.get("IHP_WINS_CKAN_API_KEY", "").strip()
-        )
-    # Tolerate common Airflow Variable entry mistakes without changing the
-    # actual token: JSON/string quotes and an HTTP-style Bearer prefix.
-    if len(key) >= 2 and key[0] == key[-1] and key[0] in {'"', "'"}:
-        key = key[1:-1].strip()
-    if key.lower().startswith("bearer "):
-        key = key[7:].strip()
-    if not key:
-        raise RuntimeError("CKAN_API_KEY is required when reach GeoJSON changes")
-    return key
-
-
-def ckan_key_fingerprint(api_key: str) -> str:
-    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
-
-
-def validate_reach_ckan_key(api_key: str, timeout: int = 30) -> None:
-    """Fail fast unless CKAN recognizes the token as an authenticated user."""
-    session = requests.Session()
-    session.headers.update({"Authorization": api_key, "X-CKAN-API-Key": api_key})
-    response = session.post(
-        "https://ihp-wins.unesco.org/api/3/action/dashboard_activity_list",
-        data={"limit": 1}, timeout=timeout,
-    )
-    if not response.ok:
-        detail = (response.text or "").strip().replace("\x00", "")[:2000]
-        raise RuntimeError(
-            f"CKAN did not recognize the configured API token (HTTP "
-            f"{response.status_code}, fingerprint={ckan_key_fingerprint(api_key)}, "
-            f"length={len(api_key)}): {detail or '<empty response>'}"
-        )
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise RuntimeError("CKAN credential check returned invalid JSON") from exc
-    if not payload.get("success"):
-        raise RuntimeError(
-            f"CKAN credential check failed (fingerprint={ckan_key_fingerprint(api_key)}): "
-            f"{response.text[:2000]}"
-        )
-
-
-def load_ckan_reach_geojson(resource_id: str, api_key: str, timeout: int = 180) -> dict[str, Any]:
-    """Read the existing private target so replacement cannot change its contract."""
-    session = requests.Session()
-    session.headers.update({"Authorization": api_key, "X-CKAN-API-Key": api_key})
-    metadata_response = session.post(
-        "https://ihp-wins.unesco.org/api/3/action/resource_show",
-        data={"id": resource_id}, timeout=min(timeout, 30),
-    )
-    if not metadata_response.ok:
-        raise RuntimeError(
-            f"Cannot read target CKAN resource {resource_id}: "
-            f"HTTP {metadata_response.status_code}: {metadata_response.text[:2000]}"
-        )
-    metadata = metadata_response.json()
-    if not metadata.get("success") or not (metadata.get("result") or {}).get("url"):
-        raise RuntimeError(f"Invalid CKAN resource metadata: {metadata_response.text[:2000]}")
-    download_response = session.get(metadata["result"]["url"], timeout=timeout)
-    if not download_response.ok:
-        raise RuntimeError(
-            f"Cannot download target CKAN GeoJSON {resource_id}: "
-            f"HTTP {download_response.status_code}: {download_response.text[:1000]}"
-        )
-    try:
-        payload = download_response.json()
-    except ValueError as exc:
-        raise RuntimeError("Target CKAN resource is not valid JSON") from exc
-    if payload.get("type") != "FeatureCollection" or not isinstance(payload.get("features"), list):
-        raise RuntimeError("Target CKAN resource is not a GeoJSON FeatureCollection")
-    return payload
-
-
-def geojson_property_columns(payload: dict[str, Any]) -> list[str]:
-    columns: list[str] = []
-    seen: set[str] = set()
-    for feature in payload.get("features", []):
-        for column in (feature.get("properties") or {}):
-            if column not in seen:
-                seen.add(column)
-                columns.append(column)
-    return columns
-
-
-def validate_reach_geojson_contract(
-    target: dict[str, Any], candidate: dict[str, Any]
-) -> dict[str, Any]:
-    target_columns = geojson_property_columns(target)
-    candidate_columns = geojson_property_columns(candidate)
-    target_ids = {
-        clean_id((feature.get("properties") or {}).get("reach_id", ""))
-        for feature in target.get("features", [])
-    } - {""}
-    candidate_ids = {
-        clean_id((feature.get("properties") or {}).get("reach_id", ""))
-        for feature in candidate.get("features", [])
-    } - {""}
-    missing_columns = [item for item in target_columns if item not in candidate_columns]
-    extra_columns = [item for item in candidate_columns if item not in target_columns]
-    missing_ids = sorted(target_ids - candidate_ids)
-    extra_ids = sorted(candidate_ids - target_ids)
-    if missing_columns or extra_columns or missing_ids or extra_ids:
-        raise RuntimeError(
-            "Candidate GeoJSON does not match the private CKAN resource contract: "
-            f"missing_columns={missing_columns}, extra_columns={extra_columns}, "
-            f"missing_reach_ids={missing_ids[:20]} (count={len(missing_ids)}), "
-            f"extra_reach_ids={extra_ids[:20]} (count={len(extra_ids)})"
-        )
-    return {
-        "columns": target_columns,
-        "column_count": len(target_columns),
-        "reach_count": len(target_ids),
-    }
-
-
-def publish_reach_geojson(
-    resource_id: str, geometry: bytes, filename: str, timeout: int,
-    api_key: str | None = None,
-) -> None:
-    """Publish exactly like the proven standalone Dnipro reach publisher."""
-    key = resolve_reach_ckan_key(api_key)
-
-    session = requests.Session()
-    session.headers.update({"Authorization": key, "X-CKAN-API-Key": key})
-    response = session.post(
-        "https://ihp-wins.unesco.org/api/3/action/resource_update",
-        data={"id": resource_id, "format": "GeoJSON"},
-        files={"upload": (filename, io.BytesIO(geometry), "application/geo+json")},
-        timeout=timeout,
-    )
-    if not response.ok:
-        detail = (response.text or "").strip().replace("\x00", "")[:2000]
-        raise RuntimeError(
-            f"CKAN reach resource_update failed with HTTP {response.status_code}: "
-            f"{detail or '<empty response>'}"
-        )
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise RuntimeError(
-            f"CKAN reach resource_update returned invalid JSON: {response.text[:1000]}"
-        ) from exc
-    if not payload.get("success"):
-        raise RuntimeError(response.text[:2000])
-
-
 def discover_reach_regions(
     connection_string_env: str = "AZURE_STORAGE_CONNECTION_STRING",
     region_filter: str | None = None,
@@ -246,7 +63,9 @@ def discover_reach_regions(
             continue
         manifest = load_json(container, item.name) or {}
         reaches = (manifest.get("products") or {}).get("reaches") or {}
-        if str(manifest.get("status", "active")).lower() not in {"active", "published", "historical_built"}:
+        if str(manifest.get("status", "active")).lower() not in {
+            "active", "published", "historical_built",
+        }:
             continue
         if reaches.get("enabled") is False:
             continue
@@ -257,239 +76,223 @@ def discover_reach_regions(
     return sorted(regions, key=lambda item: item["region_id"])
 
 
-def merge_reaches(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame:
-    keys = ["reach_id", "time_utc", "cycle_id", "pass_id"]
-    existing = existing.copy() if existing is not None else pd.DataFrame()
-    incoming = incoming.copy() if incoming is not None else pd.DataFrame()
-    # Hydrocron does not supply DAWG values. Preserve an existing consensus_q
-    # when an overlapping Hydrocron observation is revised.
-    if not existing.empty and not incoming.empty and all(key in existing and key in incoming for key in keys):
-        dawg = existing[keys + ["consensus_q", "consensus_q_units"]].drop_duplicates(keys, keep="last")
-        incoming = incoming.drop(columns=["consensus_q", "consensus_q_units"], errors="ignore").merge(
-            dawg, on=keys, how="left"
-        )
-        incoming["consensus_q_units"] = incoming["consensus_q_units"].fillna("m^3/s")
-    frames = [frame for frame in (existing, incoming) if not frame.empty]
-    if not frames:
+def read_reach_csv(data: bytes | None) -> pd.DataFrame:
+    if not data:
         return pd.DataFrame(columns=REACH_OUTPUT_COLUMNS)
-    output = pd.concat(frames, ignore_index=True, sort=False)
+    try:
+        return pd.read_csv(io.BytesIO(data))
+    except EmptyDataError:
+        return pd.DataFrame(columns=REACH_OUTPUT_COLUMNS)
+
+
+def normalize_reaches(frame: pd.DataFrame) -> pd.DataFrame:
+    """Enforce the exact nine-column contract used by the proven updater."""
+    if frame is None or frame.empty:
+        return pd.DataFrame(columns=REACH_OUTPUT_COLUMNS)
+    output = frame.copy()
+    if "time_str" in output and "time_utc" not in output:
+        output = output.rename(columns={"time_str": "time_utc"})
+    if "time_utc" not in output:
+        raise ValueError("Reach CSV has no time_utc or time_str field")
+    parsed = pd.to_datetime(output["time_utc"], format="mixed", errors="coerce", utc=True)
+    output = output.loc[parsed.notna()].copy()
+    output["time_utc"] = parsed.loc[output.index].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    for column in ("wse", "slope", "width", "reach_q", "consensus_q"):
+        if column in output:
+            output[column] = pd.to_numeric(output[column], errors="coerce")
+            output.loc[output[column] <= FILL_VALUE_THRESHOLD, column] = pd.NA
+    for column, value in {
+        "wse_units": "m", "slope_units": "m/m", "width_units": "m",
+    }.items():
+        if column not in output:
+            output[column] = value
+        else:
+            output[column] = output[column].fillna(value)
+    if "consensus_q" not in output:
+        output["consensus_q"] = pd.NA
     for column in REACH_OUTPUT_COLUMNS:
         if column not in output:
             output[column] = pd.NA
-    return output[REACH_OUTPUT_COLUMNS].drop_duplicates(keys, keep="last").sort_values("time_utc").reset_index(drop=True)
+    data_columns = ["wse", "slope", "width", "reach_q", "consensus_q"]
+    output = output.loc[output[data_columns].notna().any(axis=1)]
+    return (
+        output[REACH_OUTPUT_COLUMNS]
+        .drop_duplicates(["time_utc"], keep="last")
+        .sort_values("time_utc").reset_index(drop=True)
+    )
+
+
+def merge_reaches(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame:
+    existing = normalize_reaches(existing)
+    incoming = normalize_reaches(incoming)
+    if not existing.empty and not incoming.empty:
+        prior_q = existing[["time_utc", "consensus_q"]].drop_duplicates("time_utc", keep="last")
+        incoming = incoming.drop(columns=["consensus_q"], errors="ignore").merge(
+            prior_q, on="time_utc", how="left"
+        )
+    frames = [frame for frame in (existing, incoming) if not frame.empty]
+    if not frames:
+        return pd.DataFrame(columns=REACH_OUTPUT_COLUMNS)
+    return normalize_reaches(pd.concat(frames, ignore_index=True, sort=False))
+
+
+def latest_observation(frame: pd.DataFrame) -> str | None:
+    if frame.empty:
+        return None
+    values = pd.to_datetime(frame["time_utc"], format="mixed", errors="coerce", utc=True).dropna()
+    return None if values.empty else utc_text(values.max().to_pydatetime())
 
 
 def update_one_reach(
-    *, container, properties: dict[str, Any], blob: str, query_start_utc: str,
-    query_end_utc: str, timeout: int, retries: int,
+    *, container, properties: dict[str, Any], blob: str, query_end_utc: str,
+    overlap_hours: int, backfill_days_if_empty: int, timeout: int, retries: int,
 ) -> ReachResult:
     reach_id = clean_id(properties.get("reach_id", ""))
-    count = int(properties.get("observation_count") or 0)
-    first = str(properties.get("first_observation_utc") or "")
-    latest = str(properties.get("latest_observation_utc") or "")
     try:
-        params = {"feature": "Reach", "feature_id": reach_id, "start_time": query_start_utc,
-                  "end_time": query_end_utc, "output": "csv",
-                  "collection_name": "SWOT_L2_HR_RiverSP_D", "fields": REACH_FIELDS}
+        previous_bytes = download_blob(container, blob)
+        existing = normalize_reaches(read_reach_csv(previous_bytes))
+        latest = latest_observation(existing)
+        end = parse_utc(query_end_utc)
+        start = (
+            parse_utc(latest) - timedelta(hours=overlap_hours)
+            if latest else end - timedelta(days=backfill_days_if_empty)
+        )
+        if start >= end:
+            start = end - timedelta(days=1)
+        start_text = utc_text(start)
+        params = {
+            "feature": "Reach", "feature_id": reach_id,
+            "start_time": start_text, "end_time": query_end_utc,
+            "output": "csv", "collection_name": "SWOT_L2_HR_RiverSP_D",
+            "fields": REACH_FIELDS,
+        }
         time.sleep(random.uniform(0.05, 0.2))
         response = get_with_retries(params, timeout, retries)
         if response.status_code == 400:
-            message = (response.text or "")[:400]
-            if "not found" in message.lower():
-                status = "not_found" if count == 0 else "success_no_data"
-                return ReachResult(reach_id, status, query_start_utc, query_end_utc,
-                                   previous_rows=count, final_rows=count,
-                                   first_observation_utc=first, latest_observation_utc=latest,
-                                   message=message)
-            return ReachResult(reach_id, "retryable_failure", query_start_utc, query_end_utc, message=message)
+            canonical = csv_bytes(existing)
+            changed = previous_bytes is not None and canonical != previous_bytes
+            if changed:
+                upload_bytes(container, blob, canonical, "text/csv; charset=utf-8")
+            first, last = observation_bounds(existing)
+            return ReachResult(
+                reach_id, "success_no_data" if len(existing) else "not_found",
+                start_text, query_end_utc, previous_rows=len(existing), final_rows=len(existing),
+                first_observation_utc=first, latest_observation_utc=last,
+                blob_changed=changed, message=(response.text or "")[:400],
+            )
         response.raise_for_status()
         raw = response_frame(response.text)
         incoming = normalize_reaches(raw)
-        if incoming.empty:
-            return ReachResult(reach_id, "success_no_data", query_start_utc, query_end_utc,
-                               input_rows=len(raw), previous_rows=count, final_rows=count,
-                               first_observation_utc=first, latest_observation_utc=latest)
-        previous_bytes = download_blob(container, blob)
-        if previous_bytes is None and count > 0:
-            raise RuntimeError("GeoJSON reports observations but the historical CSV is missing")
-        existing = pd.read_csv(__import__("io").BytesIO(previous_bytes), dtype={"reach_id": "string"}) if previous_bytes else pd.DataFrame(columns=REACH_OUTPUT_COLUMNS)
-        canonical = merge_reaches(pd.DataFrame(columns=REACH_OUTPUT_COLUMNS), existing)
-        final = merge_reaches(existing, incoming)
+        existing_times = set(existing["time_utc"].astype(str))
+        incoming_times = set(incoming["time_utc"].astype(str))
+        novel_count = len(incoming_times - existing_times)
+        final = merge_reaches(existing, incoming) if novel_count else existing
         encoded = csv_bytes(final)
-        changed = encoded != csv_bytes(canonical)
-        if changed:
+        empty_bytes = csv_bytes(pd.DataFrame(columns=REACH_OUTPUT_COLUMNS))
+        changed = encoded != (previous_bytes or empty_bytes)
+        if changed and (previous_bytes is not None or not final.empty):
             upload_bytes(container, blob, encoded, "text/csv; charset=utf-8")
-        first, latest = observation_bounds(final)
-        return ReachResult(reach_id, "success_with_data", query_start_utc, query_end_utc,
-                           len(raw), len(existing), len(final), first, latest, changed)
+        first, last = observation_bounds(final)
+        return ReachResult(
+            reach_id, "success_with_data" if novel_count else "success_no_data",
+            start_text, query_end_utc, input_rows=len(raw), previous_rows=len(existing),
+            final_rows=len(final), first_observation_utc=first,
+            latest_observation_utc=last, blob_changed=changed,
+            message=f"novel_timestamps={novel_count}",
+        )
     except Exception as exc:
-        return ReachResult(reach_id, "retryable_failure", query_start_utc, query_end_utc,
-                           previous_rows=count, final_rows=count,
-                           first_observation_utc=first, latest_observation_utc=latest,
-                           message=str(exc)[:1000])
+        return ReachResult(reach_id, "retryable_failure", "", query_end_utc, message=str(exc)[:1000])
 
 
 def update_reach_region(
     *, region: dict[str, str], connection_string_env: str = "AZURE_STORAGE_CONNECTION_STRING",
-    overlap_hours: int = 48, batch_size: int = 500, request_workers: int = 4,
+    overlap_hours: int = 48, backfill_days_if_empty: int = 2,
+    batch_size: int = 500, request_workers: int = 4,
     timeout: int = 60, retries: int = 5, run_end_utc: str | None = None,
-    ckan_api_key: str | None = None, ckan_timeout: int = 180,
+    **_ignored: Any,
 ) -> dict[str, Any]:
     container = get_container(connection_string_env)
     region_id = safe_region(region["region_id"])
     manifest = load_json(container, region["manifest_blob"])
+    if not manifest:
+        raise RuntimeError(f"Missing manifest for {region_id}")
     reaches = manifest["products"]["reaches"]
     geometry_blob = str(reaches.get("geometry_blob") or f"regions/{region_id}/reaches/reaches.geojson")
     geometry = load_json(container, geometry_blob)
-    state_blob = f"regions/{region_id}/state/reach_update.json"
-    diagnostic_blob = f"regions/{region_id}/logs/reach_update_diagnostic_latest.json"
-    resource_id = reach_resource_id(manifest)
-    resolved_ckan_key = None
-    if resource_id:
-        resolved_ckan_key = resolve_reach_ckan_key(ckan_api_key)
-        upload_json(container, diagnostic_blob, {
-            "region_id": region_id, "phase": "validating_ckan_credentials",
-            "resource_id": resource_id,
-            "credential_fingerprint": ckan_key_fingerprint(resolved_ckan_key),
-            "credential_length": len(resolved_ckan_key),
-            "updated_utc": utc_text(utc_now()),
-        })
-        try:
-            validate_reach_ckan_key(resolved_ckan_key, min(timeout, 30))
-            target_geometry = load_ckan_reach_geojson(
-                resource_id, resolved_ckan_key, ckan_timeout
-            )
-            contract = validate_reach_geojson_contract(target_geometry, geometry)
-        except Exception as exc:
-            upload_json(container, diagnostic_blob, {
-                "region_id": region_id, "phase": "failed_validating_ckan_credentials",
-                "resource_id": resource_id,
-                "credential_fingerprint": ckan_key_fingerprint(resolved_ckan_key),
-                "credential_length": len(resolved_ckan_key),
-                "error_type": type(exc).__name__, "error": str(exc)[:2000],
-                "updated_utc": utc_text(utc_now()),
-            })
-            raise
-        upload_json(container, diagnostic_blob, {
-            "region_id": region_id, "phase": "validated_ckan_contract",
-            "resource_id": resource_id,
-            "credential_fingerprint": ckan_key_fingerprint(resolved_ckan_key),
-            **contract, "updated_utc": utc_text(utc_now()),
-        })
-    state = load_json(container, state_blob) or {}
-    historical = manifest.get("historical_summary") or {}
-    watermark = str(state.get("last_successful_end_utc") or (historical.get("window") or {}).get("end") or "2023-03-30T00:00:00Z")
-    retry_map = {clean_id(item["reach_id"]): item for item in state.get("retry_reaches", [])}
-    end = parse_utc(run_end_utc) if run_end_utc else utc_now()
-    end_text = utc_text(end)
+    if not geometry or not isinstance(geometry.get("features"), list):
+        raise RuntimeError(f"Invalid reach GeoJSON for {region_id}")
     prefix = str(reaches.get("timeseries_prefix") or f"regions/{region_id}/reaches/timeseries/").rstrip("/")
     filename = str(reaches.get("filename") or reaches.get("timeseries_filename") or "reach_{reach_id}.csv")
-    records, blob_by_id, seen = [], {}, set()
+    end = parse_utc(run_end_utc) if run_end_utc else utc_now()
+    end_text = utc_text(end)
+    run_id = f"{end.strftime('%Y%m%dT%H%M%SZ')}-{region_id}"
+    diagnostic_blob = f"regions/{region_id}/logs/reach_update_diagnostic_latest.json"
+
+    records = []
+    seen = set()
     for feature in geometry["features"]:
         props = feature.get("properties") or {}
         reach_id = clean_id(props.get("reach_id", ""))
         if not reach_id or reach_id in seen:
             continue
         seen.add(reach_id)
-        blob = f"{prefix}/{filename.format(reach_id=safe_id(reach_id))}"
-        blob_by_id[reach_id] = blob
-        records.append((reach_id, props, blob))
-    records.sort(key=lambda item: (0 if item[0] in retry_map else 1, item[0]))
+        records.append((props, f"{prefix}/{filename.format(reach_id=safe_id(reach_id))}"))
+    if not records:
+        raise RuntimeError(f"No reach IDs for {region_id}")
+
     upload_json(container, diagnostic_blob, {
-        "region_id": region_id, "phase": "querying_hydrocron", "run_end_utc": end_text,
-        "reach_count": len(records), "updated_utc": utc_text(utc_now()),
+        "region_id": region_id, "phase": "updating_reach_csvs",
+        "run_end_utc": end_text, "reach_count": len(records),
+        "csv_columns": REACH_OUTPUT_COLUMNS, "updated_utc": utc_text(utc_now()),
     })
-    results = []
+    results: list[ReachResult] = []
     for offset in range(0, len(records), batch_size):
         with ThreadPoolExecutor(max_workers=request_workers) as executor:
-            futures = []
-            for reach_id, props, blob in records[offset:offset + batch_size]:
-                start = retry_map.get(reach_id, {}).get("query_start_utc") or utc_text(parse_utc(watermark) - timedelta(hours=overlap_hours))
-                futures.append(executor.submit(update_one_reach, container=container, properties=props,
-                                               blob=blob, query_start_utc=start, query_end_utc=end_text,
-                                               timeout=timeout, retries=retries))
+            futures = [executor.submit(
+                update_one_reach, container=container, properties=props, blob=blob,
+                query_end_utc=end_text, overlap_hours=overlap_hours,
+                backfill_days_if_empty=backfill_days_if_empty,
+                timeout=timeout, retries=retries,
+            ) for props, blob in records[offset:offset + batch_size]]
             results.extend(future.result() for future in as_completed(futures))
         upload_json(container, diagnostic_blob, {
-            "region_id": region_id, "phase": "querying_hydrocron",
+            "region_id": region_id, "phase": "updating_reach_csvs",
             "run_end_utc": end_text, "completed_reaches": len(results),
             "reach_count": len(records),
             "status_counts": dict(Counter(item.status for item in results)),
             "updated_utc": utc_text(utc_now()),
         })
-    by_id = {item.reach_id: item for item in results}
-    geometry_changed = False
-    for feature in geometry["features"]:
-        props = feature.get("properties") or {}
-        result = by_id.get(clean_id(props.get("reach_id", "")))
-        if not result or result.status != "success_with_data":
-            continue
-        before = (props.get("observation_count"), props.get("latest_observation_utc"), props.get("url"))
-        props.update({"observation_count": result.final_rows, "has_data": result.final_rows > 0,
-                      "first_observation_utc": result.first_observation_utc or None,
-                      "latest_observation_utc": result.latest_observation_utc or None})
-        if result.final_rows:
-            props["url"] = f"https://{AZURE_ACCOUNT}.blob.core.windows.net/{AZURE_CONTAINER}/{blob_by_id[result.reach_id]}"
-        geometry_changed |= before != (props.get("observation_count"), props.get("latest_observation_utc"), props.get("url"))
-    run_id = f"{end.strftime('%Y%m%dT%H%M%SZ')}-{region_id}"
-    # Persist per-reach diagnostics before publication, because CKAN failures
-    # must remain debuggable even when the Airflow pod logs are unavailable.
-    upload_bytes(container, f"regions/{region_id}/logs/reach_updates/{run_id}.csv",
-                 csv_bytes(pd.DataFrame(asdict(item) for item in results)), "text/csv; charset=utf-8")
-    if geometry_changed:
-        encoded = json.dumps(geometry, separators=(",", ":")).encode("utf-8")
-        if resource_id:
-            upload_json(container, diagnostic_blob, {
-                "region_id": region_id, "phase": "publishing_ckan",
-                "run_end_utc": end_text, "resource_id": resource_id,
-                "updated_utc": utc_text(utc_now()),
-            })
-            try:
-                publish_reach_geojson(
-                    resource_id, encoded,
-                    f"{region_id}_sword_reaches_version_d.geojson",
-                    ckan_timeout, api_key=resolved_ckan_key,
-                )
-            except Exception as exc:
-                upload_json(container, diagnostic_blob, {
-                    "region_id": region_id, "phase": "failed_publishing_ckan",
-                    "run_end_utc": end_text, "resource_id": resource_id,
-                    "error_type": type(exc).__name__, "error": str(exc)[:2000],
-                    "updated_utc": utc_text(utc_now()),
-                })
-                raise
-        upload_json(container, diagnostic_blob, {
-            "region_id": region_id, "phase": "publishing_azure_geojson",
-            "run_end_utc": end_text, "geometry_blob": geometry_blob,
-            "updated_utc": utc_text(utc_now()),
-        })
-        upload_bytes(container, geometry_blob, encoded, "application/geo+json; charset=utf-8")
-    retry = []
-    for result in results:
-        if result.status == "retryable_failure":
-            prior = retry_map.get(result.reach_id) or {}
-            retry.append({"reach_id": result.reach_id,
-                          "query_start_utc": prior.get("query_start_utc") or result.query_start_utc,
-                          "consecutive_failures": int(prior.get("consecutive_failures") or 0) + 1,
-                          "last_error": result.message, "last_attempt_utc": end_text})
-    current_dawg = load_json(container, "reference/dawg/current.json") or {}
-    summary = {"schema_version": 1, "region_id": region_id, "run_id": run_id,
-               "previous_watermark_utc": watermark, "run_end_utc": end_text,
-               "reach_count": len(records), "batch_size": batch_size,
-               "batch_count": (len(records) + batch_size - 1) // batch_size,
-               "request_workers": request_workers, "overlap_hours": overlap_hours,
-               "status_counts": dict(Counter(item.status for item in results)),
-               "changed_csvs": sum(item.blob_changed for item in results),
-               "retry_queue_size": len(retry), "geometry_updated": geometry_changed,
-               "ckan_updated": bool(geometry_changed and reach_resource_id(manifest)),
-               "dawg_current_updated_utc": current_dawg.get("updated_utc")}
+
+    upload_bytes(
+        container, f"regions/{region_id}/logs/reach_updates/{run_id}.csv",
+        csv_bytes(pd.DataFrame(asdict(item) for item in sorted(results, key=lambda item: item.reach_id))),
+        "text/csv; charset=utf-8",
+    )
+    counts = Counter(item.status for item in results)
+    summary = {
+        "schema_version": 2, "region_id": region_id, "run_id": run_id,
+        "run_end_utc": end_text, "reach_count": len(records),
+        "batch_size": batch_size,
+        "batch_count": (len(records) + batch_size - 1) // batch_size,
+        "request_workers": request_workers, "overlap_hours": overlap_hours,
+        "backfill_days_if_empty": backfill_days_if_empty,
+        "csv_columns": REACH_OUTPUT_COLUMNS,
+        "status_counts": dict(counts),
+        "changed_csvs": sum(item.blob_changed for item in results),
+        "retry_queue_size": counts.get("retryable_failure", 0),
+        "geometry_updated": False, "ckan_updated": False,
+    }
     upload_json(container, f"regions/{region_id}/logs/reach_update_latest.json", summary)
-    upload_json(container, state_blob, {"schema_version": 1, "region_id": region_id,
-                                      "last_successful_end_utc": end_text,
-                                      "updated_utc": utc_text(utc_now()), "last_run_id": run_id,
-                                      "retry_reaches": retry})
+    upload_json(container, f"regions/{region_id}/state/reach_update.json", {
+        "schema_version": 2, "region_id": region_id, "last_run_id": run_id,
+        "updated_utc": utc_text(utc_now()), "per_reach_csv_watermarks": True,
+        "retry_reaches": [asdict(item) for item in results if item.status == "retryable_failure"],
+    })
     upload_json(container, diagnostic_blob, {
         "region_id": region_id, "phase": "complete", "run_id": run_id,
-        "run_end_utc": end_text, "status_counts": summary["status_counts"],
-        "retry_queue_size": len(retry), "updated_utc": utc_text(utc_now()),
+        "run_end_utc": end_text, "status_counts": dict(counts),
+        "changed_csvs": summary["changed_csvs"],
+        "geometry_updated": False, "ckan_updated": False,
+        "updated_utc": utc_text(utc_now()),
     })
     return summary
