@@ -1,13 +1,14 @@
-"""Regional daily SWOT reach updater modeled on the proven Dnipro DAG.
+"""Regional daily SWOT reach updater.
 
-The regional GeoJSON supplies reach IDs and stable CSV links. Daily runs update
-only per-reach Azure CSVs and audit/state blobs; they never replace CKAN or
-GeoJSON resources.
+Each reach CSV is updated independently using the proven Dnipro ingestion
+logic. After all reaches finish, feature metadata is applied to one regional
+GeoJSON and that single payload is published to CKAN and Azure.
 """
 
 from __future__ import annotations
 
 import io
+import json
 import random
 import time
 from collections import Counter
@@ -20,9 +21,10 @@ import pandas as pd
 from pandas.errors import EmptyDataError
 
 from swot_nodes_update import (
-    clean_id, csv_bytes, download_blob, get_container, get_with_retries,
+    AZURE_ACCOUNT, AZURE_CONTAINER, clean_id, csv_bytes, download_blob,
+    get_container, get_with_retries,
     load_json, observation_bounds, parse_utc, response_frame, safe_id,
-    safe_region, upload_bytes, upload_json, utc_now, utc_text,
+    safe_region, update_ckan_resource, upload_bytes, upload_json, utc_now, utc_text,
 )
 
 REACH_FIELDS = "time_str,wse,slope,width,reach_q"
@@ -186,7 +188,10 @@ def update_one_reach(
         existing_times = set(existing["time_utc"].astype(str))
         incoming_times = set(incoming["time_utc"].astype(str))
         novel_count = len(incoming_times - existing_times)
-        final = merge_reaches(existing, incoming) if novel_count else existing
+        # Merge the complete overlap, as the working updater does. Hydrocron
+        # may revise an already-known timestamp; novelty alone is not enough
+        # to decide whether the CSV changed.
+        final = merge_reaches(existing, incoming)
         encoded = csv_bytes(final)
         empty_bytes = csv_bytes(pd.DataFrame(columns=REACH_OUTPUT_COLUMNS))
         changed = encoded != (previous_bytes or empty_bytes)
@@ -194,7 +199,7 @@ def update_one_reach(
             upload_bytes(container, blob, encoded, "text/csv; charset=utf-8")
         first, last = observation_bounds(final)
         return ReachResult(
-            reach_id, "success_with_data" if novel_count else "success_no_data",
+            reach_id, "success_with_data" if changed else "success_no_data",
             start_text, query_end_utc, input_rows=len(raw), previous_rows=len(existing),
             final_rows=len(final), first_observation_utc=first,
             latest_observation_utc=last, blob_changed=changed,
@@ -209,7 +214,7 @@ def update_reach_region(
     overlap_hours: int = 48, backfill_days_if_empty: int = 2,
     batch_size: int = 500, request_workers: int = 4,
     timeout: int = 60, retries: int = 5, run_end_utc: str | None = None,
-    **_ignored: Any,
+    ckan_timeout: int = 180, **_ignored: Any,
 ) -> dict[str, Any]:
     container = get_container(connection_string_env)
     region_id = safe_region(region["region_id"])
@@ -229,6 +234,7 @@ def update_reach_region(
     diagnostic_blob = f"regions/{region_id}/logs/reach_update_diagnostic_latest.json"
 
     records = []
+    blob_by_id: dict[str, str] = {}
     seen = set()
     for feature in geometry["features"]:
         props = feature.get("properties") or {}
@@ -236,7 +242,9 @@ def update_reach_region(
         if not reach_id or reach_id in seen:
             continue
         seen.add(reach_id)
-        records.append((props, f"{prefix}/{filename.format(reach_id=safe_id(reach_id))}"))
+        blob = f"{prefix}/{filename.format(reach_id=safe_id(reach_id))}"
+        blob_by_id[reach_id] = blob
+        records.append((props, blob))
     if not records:
         raise RuntimeError(f"No reach IDs for {region_id}")
 
@@ -263,6 +271,53 @@ def update_reach_region(
             "updated_utc": utc_text(utc_now()),
         })
 
+    by_id = {item.reach_id: item for item in results}
+    geometry_changed = False
+    for feature in geometry["features"]:
+        props = feature.get("properties") or {}
+        result = by_id.get(clean_id(props.get("reach_id", "")))
+        if not result or result.status == "retryable_failure":
+            continue
+        before = (
+            props.get("observation_count"), props.get("has_data"),
+            props.get("first_observation_utc"), props.get("latest_observation_utc"),
+            props.get("url"),
+        )
+        props["observation_count"] = result.final_rows
+        props["has_data"] = result.final_rows > 0
+        props["first_observation_utc"] = result.first_observation_utc or None
+        props["latest_observation_utc"] = result.latest_observation_utc or None
+        if result.final_rows:
+            props["url"] = (
+                f"https://{AZURE_ACCOUNT}.blob.core.windows.net/{AZURE_CONTAINER}/"
+                f"{blob_by_id[result.reach_id]}"
+            )
+        else:
+            props.pop("url", None)
+        after = (
+            props.get("observation_count"), props.get("has_data"),
+            props.get("first_observation_utc"), props.get("latest_observation_utc"),
+            props.get("url"),
+        )
+        geometry_changed |= before != after
+
+    ckan_updated = False
+    if geometry_changed:
+        geometry_bytes = json.dumps(
+            geometry, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        resource_id = str((manifest.get("ckan") or {}).get("reach_resource_id") or "").strip()
+        if not resource_id:
+            raise RuntimeError(f"Missing reach_resource_id for {region_id}")
+        # Publish the identical payload once to each backend. CKAN goes first
+        # so a CKAN failure leaves Azure metadata old and retryable next run.
+        update_ckan_resource(
+            resource_id, geometry_bytes,
+            f"{region_id}_sword_reaches_version_d.geojson", ckan_timeout,
+        )
+        upload_bytes(container, geometry_blob, geometry_bytes, "application/geo+json; charset=utf-8")
+        ckan_updated = True
+
     upload_bytes(
         container, f"regions/{region_id}/logs/reach_updates/{run_id}.csv",
         csv_bytes(pd.DataFrame(asdict(item) for item in sorted(results, key=lambda item: item.reach_id))),
@@ -280,7 +335,7 @@ def update_reach_region(
         "status_counts": dict(counts),
         "changed_csvs": sum(item.blob_changed for item in results),
         "retry_queue_size": counts.get("retryable_failure", 0),
-        "geometry_updated": False, "ckan_updated": False,
+        "geometry_updated": geometry_changed, "ckan_updated": ckan_updated,
     }
     upload_json(container, f"regions/{region_id}/logs/reach_update_latest.json", summary)
     upload_json(container, f"regions/{region_id}/state/reach_update.json", {
@@ -292,7 +347,7 @@ def update_reach_region(
         "region_id": region_id, "phase": "complete", "run_id": run_id,
         "run_end_utc": end_text, "status_counts": dict(counts),
         "changed_csvs": summary["changed_csvs"],
-        "geometry_updated": False, "ckan_updated": False,
+        "geometry_updated": geometry_changed, "ckan_updated": ckan_updated,
         "updated_utc": utc_text(utc_now()),
     })
     return summary
