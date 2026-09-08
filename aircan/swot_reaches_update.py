@@ -8,6 +8,7 @@ GeoJSON and that single payload is published to CKAN and Azure.
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import random
 import time
@@ -18,13 +19,15 @@ from datetime import timedelta
 from typing import Any
 
 import pandas as pd
+import requests
 from pandas.errors import EmptyDataError
 
 from swot_nodes_update import (
-    AZURE_ACCOUNT, AZURE_CONTAINER, clean_id, csv_bytes, download_blob,
+    AZURE_ACCOUNT, AZURE_CONTAINER, CKAN_BASE, clean_id, csv_bytes, download_blob,
     get_container, get_with_retries,
     load_json, observation_bounds, parse_utc, response_frame, safe_id,
-    safe_region, update_ckan_resource, upload_bytes, upload_json, utc_now, utc_text,
+    runtime_secret, safe_region, update_ckan_resource, upload_bytes, upload_json,
+    utc_now, utc_text,
 )
 
 REACH_FIELDS = "time_str,wse,slope,width,reach_q"
@@ -214,7 +217,7 @@ def update_reach_region(
     overlap_hours: int = 48, backfill_days_if_empty: int = 2,
     batch_size: int = 500, request_workers: int = 4,
     timeout: int = 60, retries: int = 5, run_end_utc: str | None = None,
-    ckan_timeout: int = 900, **_ignored: Any,
+    ckan_timeout: int = 900, ckan_api_key: str | None = None, **_ignored: Any,
 ) -> dict[str, Any]:
     container = get_container(connection_string_env)
     region_id = safe_region(region["region_id"])
@@ -232,6 +235,40 @@ def update_reach_region(
     end_text = utc_text(end)
     run_id = f"{end.strftime('%Y%m%dT%H%M%SZ')}-{region_id}"
     diagnostic_blob = f"regions/{region_id}/logs/reach_update_diagnostic_latest.json"
+
+    ckan = manifest.get("ckan") or {}
+    dataset_id = str(ckan.get("dataset_id") or "").strip()
+    resource_id = str(ckan.get("reach_resource_id") or "").strip()
+    api_key = (ckan_api_key or "").strip()
+    if not api_key:
+        api_key = runtime_secret("CKAN_API_KEY") or runtime_secret("IHP_WINS_CKAN_API_KEY")
+    fingerprint = hashlib.sha256(api_key.encode()).hexdigest()[:16] if api_key else "missing"
+    if not dataset_id or not resource_id or not api_key:
+        upload_json(container, diagnostic_blob, {
+            "region_id": region_id, "phase": "ckan_preflight_failed",
+            "run_id": run_id, "dataset_id": dataset_id,
+            "resource_id": resource_id, "key_fingerprint": fingerprint,
+            "error": "Missing CKAN dataset ID, resource ID, or API key",
+            "updated_utc": utc_text(utc_now()),
+        })
+        raise RuntimeError("Missing CKAN dataset ID, reach resource ID, or API key")
+    preflight = requests.post(
+        f"{CKAN_BASE}/api/3/action/resource_show",
+        headers={"Authorization": api_key, "X-CKAN-API-Key": api_key},
+        data={"id": resource_id}, timeout=60,
+    )
+    if not preflight.ok:
+        detail = (preflight.text or "").strip().replace("\x00", "")[:2000]
+        upload_json(container, diagnostic_blob, {
+            "region_id": region_id, "phase": "ckan_preflight_failed",
+            "run_id": run_id, "dataset_id": dataset_id,
+            "resource_id": resource_id, "key_fingerprint": fingerprint,
+            "key_length": len(api_key), "http_status": preflight.status_code,
+            "error": detail, "updated_utc": utc_text(utc_now()),
+        })
+        raise RuntimeError(
+            f"CKAN preflight failed with HTTP {preflight.status_code}: {detail}"
+        )
 
     records = []
     blob_by_id: dict[str, str] = {}
@@ -306,9 +343,6 @@ def update_reach_region(
         geometry_bytes = json.dumps(
             geometry, ensure_ascii=False, separators=(",", ":")
         ).encode("utf-8")
-        resource_id = str((manifest.get("ckan") or {}).get("reach_resource_id") or "").strip()
-        if not resource_id:
-            raise RuntimeError(f"Missing reach_resource_id for {region_id}")
         # Publish the identical payload once to each backend. CKAN goes first
         # so a CKAN failure leaves Azure metadata old and retryable next run.
         upload_json(container, diagnostic_blob, {
@@ -322,6 +356,7 @@ def update_reach_region(
             update_ckan_resource(
                 resource_id, geometry_bytes,
                 f"{region_id}_sword_reaches_version_d.geojson", ckan_timeout,
+                api_key=api_key,
             )
         except Exception as exc:
             upload_json(container, diagnostic_blob, {
