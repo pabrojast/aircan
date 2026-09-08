@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import io
+import os
 import random
 import time
 from collections import Counter
@@ -12,11 +14,12 @@ from datetime import timedelta
 from typing import Any
 
 import pandas as pd
+import requests
 
 from swot_nodes_update import (
     AZURE_ACCOUNT, AZURE_CONTAINER, clean_id, csv_bytes, download_blob,
     get_container, get_with_retries, load_json, observation_bounds,
-    parse_utc, response_frame, safe_id, safe_region, update_ckan_resource,
+    parse_utc, response_frame, safe_id, safe_region,
     upload_bytes, upload_json, utc_now, utc_text,
 )
 
@@ -73,6 +76,44 @@ class ReachResult:
 
 def reach_resource_id(manifest: dict[str, Any]) -> str | None:
     return (manifest.get("ckan") or {}).get("reach_resource_id")
+
+
+def publish_reach_geojson(
+    resource_id: str, geometry: bytes, filename: str, timeout: int,
+    api_key: str | None = None,
+) -> None:
+    """Publish exactly like the proven standalone Dnipro reach publisher."""
+    key = (api_key or "").strip()
+    if not key:
+        key = (
+            os.environ.get("CKAN_API_KEY", "").strip()
+            or os.environ.get("IHP_WINS_CKAN_API_KEY", "").strip()
+        )
+    if not key:
+        raise RuntimeError("CKAN_API_KEY is required when reach GeoJSON changes")
+
+    session = requests.Session()
+    session.headers.update({"Authorization": key, "X-CKAN-API-Key": key})
+    response = session.post(
+        "https://ihp-wins.unesco.org/api/3/action/resource_update",
+        data={"id": resource_id, "format": "GeoJSON"},
+        files={"upload": (filename, io.BytesIO(geometry), "application/geo+json")},
+        timeout=timeout,
+    )
+    if not response.ok:
+        detail = (response.text or "").strip().replace("\x00", "")[:2000]
+        raise RuntimeError(
+            f"CKAN reach resource_update failed with HTTP {response.status_code}: "
+            f"{detail or '<empty response>'}"
+        )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            f"CKAN reach resource_update returned invalid JSON: {response.text[:1000]}"
+        ) from exc
+    if not payload.get("success"):
+        raise RuntimeError(response.text[:2000])
 
 
 def discover_reach_regions(
@@ -177,6 +218,7 @@ def update_reach_region(
     *, region: dict[str, str], connection_string_env: str = "AZURE_STORAGE_CONNECTION_STRING",
     overlap_hours: int = 48, batch_size: int = 500, request_workers: int = 4,
     timeout: int = 60, retries: int = 5, run_end_utc: str | None = None,
+    ckan_api_key: str | None = None, ckan_timeout: int = 180,
 ) -> dict[str, Any]:
     container = get_container(connection_string_env)
     region_id = safe_region(region["region_id"])
@@ -255,7 +297,11 @@ def update_reach_region(
                 "updated_utc": utc_text(utc_now()),
             })
             try:
-                update_ckan_resource(resource_id, encoded, f"{region_id}_sword_reaches_version_d.geojson", 180)
+                publish_reach_geojson(
+                    resource_id, encoded,
+                    f"{region_id}_sword_reaches_version_d.geojson",
+                    ckan_timeout, api_key=ckan_api_key,
+                )
             except Exception as exc:
                 upload_json(container, diagnostic_blob, {
                     "region_id": region_id, "phase": "failed_publishing_ckan",
