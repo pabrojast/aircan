@@ -459,11 +459,16 @@ def update_one_node(
         )
 
 
-def update_ckan_resource(resource_id: str, geometry: bytes, filename: str, timeout: int) -> None:
+def update_ckan_resource(
+    resource_id: str, geometry: bytes, filename: str, timeout: int,
+    api_key: str | None = None,
+) -> None:
     # CKAN_API_KEY is the current Airflow variable used by the proven Dnipro
     # publisher.  Keep the legacy environment/variable name as a fallback,
     # but never let a stale legacy key shadow the current credential.
-    api_key = runtime_secret("CKAN_API_KEY") or runtime_secret("IHP_WINS_CKAN_API_KEY")
+    api_key = (api_key or "").strip()
+    if not api_key:
+        api_key = runtime_secret("CKAN_API_KEY") or runtime_secret("IHP_WINS_CKAN_API_KEY")
     if not api_key:
         raise RuntimeError(
             "CKAN_API_KEY or IHP_WINS_CKAN_API_KEY is required when GeoJSON changes"
