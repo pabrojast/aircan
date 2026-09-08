@@ -313,12 +313,17 @@ def bootstrap_watermark(
 
 
 def query_start_for_node(
-    node_id: str, regional_watermark: str, retry_map: dict[str, dict[str, Any]], overlap_hours: int
+    node_id: str, regional_watermark: str, retry_map: dict[str, dict[str, Any]],
+    overlap_hours: int, source_lag_hours: int = 0,
 ) -> str:
     retry = retry_map.get(node_id)
     if retry and retry.get("query_start_utc"):
         return str(retry["query_start_utc"])
-    return utc_text(parse_utc(regional_watermark) - timedelta(hours=overlap_hours))
+    # SWOT observations can appear in Hydrocron several days after their
+    # observation timestamp. A processing watermark with only a short overlap
+    # permanently skips those late arrivals once the watermark advances.
+    lookback_hours = max(overlap_hours, source_lag_hours)
+    return utc_text(parse_utc(regional_watermark) - timedelta(hours=lookback_hours))
 
 
 def update_one_node(
@@ -364,6 +369,24 @@ def update_one_node(
                 node_id, "success_no_data", query_start_utc, query_end_utc,
                 input_rows=len(raw), previous_rows=previous_count, final_rows=previous_count,
                 first_observation_utc=previous_first, latest_observation_utc=previous_latest,
+            )
+        incoming_first, incoming_latest = observation_bounds(incoming)
+        if (
+            previous_latest
+            and incoming_latest
+            and parse_utc(incoming_latest) <= parse_utc(previous_latest)
+        ):
+            # The extended source-lag window intentionally rediscovers recent
+            # observations. Avoid downloading and rewriting the historical CSV
+            # unless Hydrocron contains an observation newer than the map's
+            # recorded latest timestamp.
+            return NodeResult(
+                node_id, "success_no_data", query_start_utc, query_end_utc,
+                input_rows=len(raw), accepted_rows=len(incoming),
+                previous_rows=previous_count, final_rows=previous_count,
+                first_observation_utc=previous_first,
+                latest_observation_utc=previous_latest,
+                message=f"No observation newer than {previous_latest}",
             )
         previous_bytes = download_blob(container, blob)
         if previous_bytes is None and previous_count > 0:
@@ -424,7 +447,7 @@ def update_node_region(
     *, region: dict[str, str], connection_string_env: str = "AZURE_STORAGE_CONNECTION_STRING",
     overlap_hours: int = 48, batch_size: int = 750, request_workers: int = 4,
     timeout: int = 60, retries: int = 5, run_end_utc: str | None = None,
-    ckan_timeout: int = 180,
+    ckan_timeout: int = 180, source_lag_hours: int = 336,
 ) -> dict[str, Any]:
     """Update every node in one region using internal, sequential batches."""
     if not 1 <= batch_size <= 5000:
@@ -475,7 +498,9 @@ def update_node_region(
             futures = [executor.submit(
                 update_one_node,
                 container=container, node_properties=props, blob=blob,
-                query_start_utc=query_start_for_node(node_id, watermark, retry_map, overlap_hours),
+                query_start_utc=query_start_for_node(
+                    node_id, watermark, retry_map, overlap_hours, source_lag_hours
+                ),
                 query_end_utc=end_text, timeout=timeout, retries=retries,
             ) for node_id, props, blob in batch]
             for future in as_completed(futures):
@@ -538,6 +563,7 @@ def update_node_region(
         "node_count": len(records), "batch_size": batch_size,
         "batch_count": (len(records) + batch_size - 1) // batch_size,
         "request_workers": request_workers, "overlap_hours": overlap_hours,
+        "source_lag_hours": source_lag_hours,
         "status_counts": dict(counts), "changed_csvs": sum(item.blob_changed for item in results),
         "retry_queue_size": len(next_retry), "geometry_updated": geometry_changed,
         "ckan_updated": bool(geometry_changed and node_resource_id(manifest)),
