@@ -31,7 +31,10 @@ def swot_reaches_update():
             overlap_hours=int(setting("SWOT_REACH_OVERLAP_HOURS", "48")),
             timeout=int(setting("SWOT_REACH_TIMEOUT_S", "60")),
             retries=int(setting("SWOT_REACH_REQUEST_RETRIES", "5")),
-            request_workers=int(setting("SWOT_REACH_REQUEST_WORKERS", "4")))
+            request_workers=int(setting("SWOT_REACH_REQUEST_WORKERS", "4")),
+            ckan_api_key=(setting("CKAN_API_KEY", "")
+                          or setting("IHP_WINS_CKAN_API_KEY", "")),
+            ckan_timeout=int(setting("SWOT_REACH_CKAN_TIMEOUT_S", "180")))
     update_region.expand(region=discover())
 
 dag = swot_reaches_update()
