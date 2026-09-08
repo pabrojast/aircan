@@ -46,10 +46,11 @@ def swot_nodes_update():
             region=region,
             batch_size=int(setting("SWOT_NODE_BATCH_SIZE", "750")),
             overlap_hours=int(setting("SWOT_NODE_OVERLAP_HOURS", "48")),
-            source_lag_hours=int(setting("SWOT_NODE_SOURCE_LAG_HOURS", "336")),
             timeout=int(setting("SWOT_NODE_TIMEOUT_S", "60")),
             retries=int(setting("SWOT_NODE_REQUEST_RETRIES", "5")),
             request_workers=int(setting("SWOT_NODE_REQUEST_WORKERS", "4")),
+            ckan_api_key=(setting("CKAN_API_KEY", "")
+                          or setting("IHP_WINS_CKAN_API_KEY", "")),
         )
 
     regions = discover()
