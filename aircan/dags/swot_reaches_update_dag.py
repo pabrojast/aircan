@@ -21,7 +21,9 @@ def swot_reaches_update():
     def discover() -> list[dict[str, str]]:
         from swot_reaches_update import discover_reach_regions
         return discover_reach_regions(region_filter=setting("SWOT_REACH_REGION_FILTER", "") or None)
-    @task(pool="swot_hydrocron", max_active_tis_per_dag=2)
+    # This task emits one final GeoJSON publication. A retry would repeat all
+    # reach queries and resend that publication within the same DAG run.
+    @task(pool="swot_hydrocron", max_active_tis_per_dag=2, retries=0)
     def update_region(region: dict[str, str]) -> dict:
         from swot_reaches_update import update_reach_region
         return update_reach_region(region=region,
