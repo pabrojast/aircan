@@ -13,12 +13,14 @@ import logging
 import os
 import random
 import re
+import tempfile
 import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -466,13 +468,20 @@ def update_ckan_resource(resource_id: str, geometry: bytes, filename: str, timeo
         raise RuntimeError(
             "CKAN_API_KEY or IHP_WINS_CKAN_API_KEY is required when GeoJSON changes"
         )
-    response = requests.post(
-        f"{CKAN_BASE}/api/3/action/resource_update",
-        headers={"Authorization": api_key, "X-CKAN-API-Key": api_key},
-        data={"id": resource_id, "format": "GeoJSON"},
-        files={"upload": (filename, io.BytesIO(geometry), "application/geo+json")},
-        timeout=timeout,
-    )
+    # Use the same seekable, file-backed multipart upload as the publication
+    # scripts that successfully created these resources. This also avoids
+    # holding a second in-memory multipart copy of large regional GeoJSON.
+    with tempfile.TemporaryDirectory(prefix="swot-ckan-update-") as temp_dir:
+        path = Path(temp_dir) / filename
+        path.write_bytes(geometry)
+        with path.open("rb") as stream:
+            response = requests.post(
+                f"{CKAN_BASE}/api/3/action/resource_update",
+                headers={"Authorization": api_key, "X-CKAN-API-Key": api_key},
+                data={"id": resource_id, "format": "GeoJSON"},
+                files={"upload": (filename, stream, "application/geo+json")},
+                timeout=timeout,
+            )
     if not response.ok:
         detail = (response.text or "").strip().replace("\x00", "")[:2000]
         raise RuntimeError(
@@ -490,7 +499,7 @@ def update_node_region(
     *, region: dict[str, str], connection_string_env: str = "AZURE_STORAGE_CONNECTION_STRING",
     overlap_hours: int = 48, batch_size: int = 750, request_workers: int = 4,
     timeout: int = 60, retries: int = 5, run_end_utc: str | None = None,
-    ckan_timeout: int = 180,
+    ckan_timeout: int = 900,
     ckan_api_key: str | None = None,
 ) -> dict[str, Any]:
     """Update every node in one region using internal, sequential batches."""
