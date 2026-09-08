@@ -30,7 +30,10 @@ def swot_reaches_update():
             backfill_days_if_empty=int(setting("SWOT_REACH_BACKFILL_DAYS_IF_EMPTY", "2")),
             timeout=int(setting("SWOT_REACH_TIMEOUT_S", "60")),
             retries=int(setting("SWOT_REACH_REQUEST_RETRIES", "5")),
-            request_workers=int(setting("SWOT_REACH_REQUEST_WORKERS", "4")))
+            request_workers=int(setting("SWOT_REACH_REQUEST_WORKERS", "4")),
+            ckan_timeout=int(setting("SWOT_REACH_CKAN_TIMEOUT_S", "900")),
+            ckan_api_key=(setting("CKAN_API_KEY", "")
+                          or setting("IHP_WINS_CKAN_API_KEY", "")))
     update_region.expand(region=discover())
 
 dag = swot_reaches_update()
