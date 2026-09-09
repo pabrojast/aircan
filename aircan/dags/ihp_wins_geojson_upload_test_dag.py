@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 from datetime import datetime
 
@@ -21,7 +22,18 @@ from airflow.models import Variable
 def ihp_wins_geojson_upload_test():
     @task
     def upload_geojson() -> dict:
-        api_key = Variable.get("CKAN_API_KEY")
+        stored_key = str(Variable.get("CKAN_API_KEY"))
+        api_key = stored_key.strip()
+        if api_key.startswith('"') and api_key.endswith('"'):
+            api_key = api_key[1:-1]
+
+        key_details = {
+            "stored_length": len(stored_key),
+            "sent_length": len(api_key),
+            "sha256_prefix": hashlib.sha256(api_key.encode()).hexdigest()[:16],
+            "whitespace_removed": stored_key != stored_key.strip(),
+            "quotes_removed": stored_key.strip() != api_key,
+        }
         geojson = {
             "type": "FeatureCollection",
             "features": [
@@ -37,25 +49,34 @@ def ihp_wins_geojson_upload_test():
         }
         content = json.dumps(geojson).encode("utf-8")
 
-        response = requests.post(
-            "https://ihp-wins.unesco.org/api/3/action/resource_create",
-            headers={"Authorization": api_key},
-            data={
-                "package_id": "swot-sword-regional-observations",
-                "name": "Airflow GeoJSON upload test",
-                "format": "GeoJSON",
-            },
-            files={
-                "upload": (
-                    "airflow_upload_test.geojson",
-                    io.BytesIO(content),
-                    "application/geo+json",
-                )
-            },
-            timeout=60,
-        )
-        response.raise_for_status()
-        return response.json()
+        try:
+            response = requests.post(
+                "https://ihp-wins.unesco.org/api/3/action/resource_create",
+                headers={"Authorization": api_key, "X-CKAN-API-Key": api_key},
+                data={
+                    "package_id": "swot-sword-regional-observations",
+                    "name": "Airflow GeoJSON upload test",
+                    "format": "GeoJSON",
+                },
+                files={
+                    "upload": (
+                        "airflow_upload_test.geojson",
+                        io.BytesIO(content),
+                        "application/geo+json",
+                    )
+                },
+                timeout=60,
+            )
+            return {
+                "key": key_details,
+                "status_code": response.status_code,
+                "response": response.text,
+            }
+        except requests.RequestException as error:
+            return {
+                "key": key_details,
+                "connection_error": f"{type(error).__name__}: {error}",
+            }
 
     upload_geojson()
 
