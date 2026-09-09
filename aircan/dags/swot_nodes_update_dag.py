@@ -23,6 +23,13 @@ def setting(name: str, default: str) -> str:
     return str(Variable.get(name, default_var=default))
 
 
+def ckan_api_key() -> str:
+    key = str(Variable.get("CKAN_API_KEY")).strip()
+    if key.startswith('"') and key.endswith('"'):
+        key = key[1:-1]
+    return key
+
+
 @dag(
     dag_id="swot_nodes_update",
     description="Batched incremental update of every registered Azure SWOT node product",
@@ -49,8 +56,8 @@ def swot_nodes_update():
             timeout=int(setting("SWOT_NODE_TIMEOUT_S", "60")),
             retries=int(setting("SWOT_NODE_REQUEST_RETRIES", "5")),
             request_workers=int(setting("SWOT_NODE_REQUEST_WORKERS", "4")),
-            ckan_api_key=(setting("CKAN_API_KEY", "")
-                          or setting("IHP_WINS_CKAN_API_KEY", "")),
+            ckan_timeout=int(setting("SWOT_NODE_CKAN_TIMEOUT_S", "900")),
+            ckan_api_key=ckan_api_key(),
         )
 
     regions = discover()
