@@ -231,6 +231,10 @@ def update_one_reach(
             raw = response_frame(response.text)
             if not raw.empty and not {'time_str', 'wse', 'slope', 'width', 'reach_q'}.issubset(raw.columns):
                 raise ValueError('Hydrocron CSV is missing requested columns')
+            if not raw.empty:
+                raw = raw.loc[
+                    raw['time_str'].astype(str).str.strip().str.lower().ne('no_data')
+                ].copy()
         incoming = normalize_reaches(raw)
         if not raw.empty and pd.to_datetime(raw['time_str'], format='mixed', errors='coerce', utc=True).notna().sum() == 0:
             raise ValueError('Hydrocron returned no parseable observation dates')
