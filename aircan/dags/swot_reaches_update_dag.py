@@ -12,6 +12,12 @@ from airflow.models import Variable
 def setting(name: str, default: str) -> str:
     return str(Variable.get(name, default_var=default))
 
+def ckan_api_key() -> str:
+    key = str(Variable.get("CKAN_API_KEY")).strip()
+    if key.startswith('"') and key.endswith('"'):
+        key = key[1:-1]
+    return key
+
 @dag(dag_id="swot_reaches_update", schedule_interval="0 8 * * *",
      start_date=datetime(2026, 9, 4), catchup=False, max_active_runs=1,
      default_args={"owner": "airflow", "retries": 2, "retry_delay": timedelta(minutes=10)},
@@ -32,8 +38,7 @@ def swot_reaches_update():
             retries=int(setting("SWOT_REACH_REQUEST_RETRIES", "5")),
             request_workers=int(setting("SWOT_REACH_REQUEST_WORKERS", "4")),
             ckan_timeout=int(setting("SWOT_REACH_CKAN_TIMEOUT_S", "900")),
-            ckan_api_key=(setting("CKAN_API_KEY", "")
-                          or setting("IHP_WINS_CKAN_API_KEY", "")))
+            ckan_api_key=ckan_api_key())
     update_region.expand(region=discover())
 
 dag = swot_reaches_update()
