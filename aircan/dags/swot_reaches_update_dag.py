@@ -26,7 +26,7 @@ def swot_reaches_update():
         from swot_reaches_update import update_reach_region
         return update_reach_region(region=region,
             batch_size=int(setting("SWOT_REACH_BATCH_SIZE", "500")),
-            overlap_hours=int(setting("SWOT_REACH_OVERLAP_HOURS", "48")),
+            overlap_hours=0,
             backfill_days_if_empty=int(setting("SWOT_REACH_BACKFILL_DAYS_IF_EMPTY", "2")),
             timeout=int(setting("SWOT_REACH_TIMEOUT_S", "60")),
             retries=int(setting("SWOT_REACH_REQUEST_RETRIES", "5")),
