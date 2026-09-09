@@ -32,6 +32,10 @@ def ihp_wins_resource_access_test():
                 "key_length": len(api_key),
                 "key_sha256_prefix": fingerprint,
                 "status_code": response.status_code,
+                "server": response.headers.get("Server"),
+                "retry_after": response.headers.get("Retry-After"),
+                "via": response.headers.get("Via"),
+                "x_cache": response.headers.get("X-Cache"),
                 "response": response.text,
             }
         except requests.RequestException as error:
