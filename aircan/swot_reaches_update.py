@@ -151,19 +151,22 @@ def latest_observation(frame: pd.DataFrame) -> str | None:
 def update_one_reach(
     *, container, properties: dict[str, Any], blob: str, query_end_utc: str,
     overlap_hours: int, backfill_days_if_empty: int, timeout: int, retries: int,
+    query_start_utc: str | None = None,
 ) -> ReachResult:
     reach_id = clean_id(properties.get("reach_id", ""))
+    start_text = query_start_utc or ""
     try:
         previous_bytes = download_blob(container, blob)
         existing = normalize_reaches(read_reach_csv(previous_bytes))
         latest = latest_observation(existing)
         end = parse_utc(query_end_utc)
         start = (
+            parse_utc(query_start_utc) if query_start_utc else
             parse_utc(latest) - timedelta(hours=overlap_hours)
             if latest else end - timedelta(days=backfill_days_if_empty)
         )
         if start >= end:
-            start = end - timedelta(days=1)
+            raise ValueError("Query start must precede query end")
         start_text = utc_text(start)
         params = {
             "feature": "Reach", "feature_id": reach_id,
@@ -174,6 +177,8 @@ def update_one_reach(
         time.sleep(random.uniform(0.05, 0.2))
         response = get_with_retries(params, timeout, retries)
         if response.status_code == 400:
+            if "were not found" not in response.text.lower() and response.text.strip().lower() != "not found":
+                raise RuntimeError(f"Hydrocron HTTP 400: {response.text[:1000]}")
             canonical = csv_bytes(existing)
             changed = previous_bytes is not None and canonical != previous_bytes
             if changed:
@@ -209,12 +214,12 @@ def update_one_reach(
             message=f"novel_timestamps={novel_count}",
         )
     except Exception as exc:
-        return ReachResult(reach_id, "retryable_failure", "", query_end_utc, message=str(exc)[:1000])
+        return ReachResult(reach_id, "retryable_failure", start_text, query_end_utc, message=str(exc)[:1000])
 
 
 def update_reach_region(
     *, region: dict[str, str], connection_string_env: str = "AZURE_STORAGE_CONNECTION_STRING",
-    overlap_hours: int = 48, backfill_days_if_empty: int = 2,
+    overlap_hours: int = 0, backfill_days_if_empty: int = 2,
     batch_size: int = 500, request_workers: int = 4,
     timeout: int = 60, retries: int = 5, run_end_utc: str | None = None,
     ckan_timeout: int = 900, ckan_api_key: str | None = None, **_ignored: Any,
@@ -234,6 +239,14 @@ def update_reach_region(
     end = parse_utc(run_end_utc) if run_end_utc else utc_now()
     end_text = utc_text(end)
     run_id = f"{end.strftime('%Y%m%dT%H%M%SZ')}-{region_id}"
+    state_blob = f"regions/{region_id}/state/reach_update.json"
+    previous_state = load_json(container, state_blob) or {}
+    successful_end = previous_state.get("last_successful_end_utc")
+    retry_starts = {str(item['reach_id']): item.get('query_start_utc')
+                    for item in previous_state.get('retry_reaches', [])}
+    # Old state contains no reliable query endpoint. Bootstrap once from each
+    # CSV's latest observation; never invent a successful historical checkpoint.
+    overlap_hours = 0
     diagnostic_blob = f"regions/{region_id}/logs/reach_update_diagnostic_latest.json"
 
     ckan = manifest.get("ckan") or {}
@@ -299,6 +312,7 @@ def update_reach_region(
             futures = [executor.submit(
                 update_one_reach, container=container, properties=props, blob=blob,
                 query_end_utc=end_text, overlap_hours=overlap_hours,
+                query_start_utc=retry_starts.get(clean_id(props.get('reach_id', ''))) or successful_end,
                 backfill_days_if_empty=backfill_days_if_empty,
                 timeout=timeout, retries=retries,
             ) for props, blob in records[offset:offset + batch_size]]
@@ -382,7 +396,9 @@ def update_reach_region(
     )
     counts = Counter(item.status for item in results)
     summary = {
-        "schema_version": 2, "region_id": region_id, "run_id": run_id,
+        "schema_version": 3, "region_id": region_id, "run_id": run_id,
+        "previous_successful_end_utc": successful_end,
+        "query_policy": "successful_run_endpoint_no_overlap",
         "run_end_utc": end_text, "reach_count": len(records),
         "batch_size": batch_size,
         "batch_count": (len(records) + batch_size - 1) // batch_size,
@@ -396,8 +412,10 @@ def update_reach_region(
     }
     upload_json(container, f"regions/{region_id}/logs/reach_update_latest.json", summary)
     upload_json(container, f"regions/{region_id}/state/reach_update.json", {
-        "schema_version": 2, "region_id": region_id, "last_run_id": run_id,
-        "updated_utc": utc_text(utc_now()), "per_reach_csv_watermarks": True,
+        "schema_version": 3, "region_id": region_id, "last_run_id": run_id,
+        "last_successful_end_utc": end_text if not counts.get('retryable_failure', 0) else successful_end,
+        "updated_utc": utc_text(utc_now()), "per_reach_csv_watermarks": False,
+        "query_policy": "successful_run_endpoint_no_overlap",
         "retry_reaches": [asdict(item) for item in results if item.status == "retryable_failure"],
     })
     upload_json(container, diagnostic_blob, {
