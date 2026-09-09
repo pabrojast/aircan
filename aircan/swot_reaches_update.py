@@ -318,7 +318,7 @@ def update_reach_region(
     if not azure_only:
         api_key = (ckan_api_key or "").strip()
         if not api_key:
-            api_key = runtime_secret("CKAN_API_KEY") or runtime_secret("IHP_WINS_CKAN_API_KEY")
+            api_key = runtime_secret("CKAN_API_KEY")
         fingerprint = hashlib.sha256(api_key.encode()).hexdigest()[:16] if api_key else "missing"
         if not dataset_id or not resource_id or not api_key:
             upload_json(container, diagnostic_blob, {
