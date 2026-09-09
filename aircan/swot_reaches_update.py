@@ -17,10 +17,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import timedelta
 from typing import Any
+from urllib.parse import urlsplit, unquote
 
 import pandas as pd
 import requests
 from pandas.errors import EmptyDataError
+from reach_dawg_cache import refresh_rows
 
 from swot_nodes_update import (
     AZURE_ACCOUNT, AZURE_CONTAINER, CKAN_BASE, clean_id, csv_bytes, download_blob,
@@ -51,6 +53,12 @@ class ReachResult:
     latest_observation_utc: str = ""
     blob_changed: bool = False
     message: str = ""
+    discharge_count: int = 0
+    chart_changed: bool = False
+    content_revision: str = ""
+    source_latest_utc: str = ""
+    chart_revision: str = ""
+    stored_hydrocron_latest_utc: str = ""
 
 
 def discover_reach_regions(
@@ -148,23 +156,55 @@ def latest_observation(frame: pd.DataFrame) -> str | None:
     return None if values.empty else utc_text(values.max().to_pydatetime())
 
 
+def merge_discharge(frame, discharge):
+    """Outer-merge DAWG-only dates without erasing Hydrocron measurements."""
+    if discharge is None or discharge.empty:
+        return frame
+    q = normalize_reaches(discharge)[['time_utc', 'consensus_q']]
+    merged = frame.merge(q, on='time_utc', how='outer', suffixes=('', '_new'))
+    merged['consensus_q'] = merged['consensus_q_new'].combine_first(merged['consensus_q'])
+    return normalize_reaches(merged.drop(columns='consensus_q_new'))
+
+
+def chart_blob_path(url, full_blob):
+    parsed = urlsplit(url)
+    path = unquote(parsed.path).lstrip('/')
+    regional_prefix = '/'.join(full_blob.split('/')[:3]) + '/'
+    expected = f'{AZURE_CONTAINER}/{regional_prefix}'
+    if (parsed.scheme != 'https' or parsed.netloc != f'{AZURE_ACCOUNT}.blob.core.windows.net'
+            or not path.startswith(expected) or '..' in path.split('/') or '\\' in path
+            or parsed.fragment or (parsed.query and not parsed.query.startswith('v='))):
+        raise ValueError('Chart URL is outside the permitted regional Azure prefix')
+    name = path[len(AZURE_CONTAINER) + 1:]
+    suffix = name[len(regional_prefix):].split('/')
+    if (len(suffix) != 2 or suffix[0] not in {'charts', 'chart-timeseries'}
+            or suffix[1] != full_blob.rsplit('/', 1)[-1] or not name.endswith('.csv')):
+        raise ValueError('Chart CSV must use its dedicated chart directory and reach filename')
+    return name
+
+
 def update_one_reach(
     *, container, properties: dict[str, Any], blob: str, query_end_utc: str,
     overlap_hours: int, backfill_days_if_empty: int, timeout: int, retries: int,
     query_start_utc: str | None = None,
+    discharge: pd.DataFrame | None = None,
 ) -> ReachResult:
     reach_id = clean_id(properties.get("reach_id", ""))
     start_text = query_start_utc or ""
     try:
         previous_bytes = download_blob(container, blob)
         existing = normalize_reaches(read_reach_csv(previous_bytes))
-        latest = latest_observation(existing)
+        latest = latest_observation(existing.loc[existing[['wse', 'slope', 'width', 'reach_q']].notna().any(axis=1)])
         end = parse_utc(query_end_utc)
         start = (
             parse_utc(query_start_utc) if query_start_utc else
             parse_utc(latest) - timedelta(hours=overlap_hours)
             if latest else end - timedelta(days=backfill_days_if_empty)
         )
+        # A successful empty request is not a data watermark. Match the proven
+        # per-CSV boundary when the source has not yet delivered newer data.
+        if latest:
+            start = min(start, parse_utc(latest) - timedelta(hours=overlap_hours))
         if start >= end:
             raise ValueError("Query start must precede query end")
         start_text = utc_text(start)
@@ -179,20 +219,21 @@ def update_one_reach(
         if response.status_code == 400:
             if "were not found" not in response.text.lower() and response.text.strip().lower() != "not found":
                 raise RuntimeError(f"Hydrocron HTTP 400: {response.text[:1000]}")
-            canonical = csv_bytes(existing)
-            changed = previous_bytes is not None and canonical != previous_bytes
-            if changed:
-                upload_bytes(container, blob, canonical, "text/csv; charset=utf-8")
-            first, last = observation_bounds(existing)
-            return ReachResult(
-                reach_id, "success_no_data" if len(existing) else "not_found",
-                start_text, query_end_utc, previous_rows=len(existing), final_rows=len(existing),
-                first_observation_utc=first, latest_observation_utc=last,
-                blob_changed=changed, message=(response.text or "")[:400],
-            )
-        response.raise_for_status()
-        raw = response_frame(response.text)
+            raw = pd.DataFrame()
+        else:
+            response.raise_for_status()
+            if not response.text.strip():
+                raise ValueError('Hydrocron returned an empty HTTP 200 body')
+            if response.text.lstrip().startswith('{'):
+                payload = json.loads(response.text)
+                if not isinstance(payload.get('results'), dict) or 'csv' not in payload['results']:
+                    raise ValueError('Hydrocron success response is missing results.csv')
+            raw = response_frame(response.text)
+            if not raw.empty and not {'time_str', 'wse', 'slope', 'width', 'reach_q'}.issubset(raw.columns):
+                raise ValueError('Hydrocron CSV is missing requested columns')
         incoming = normalize_reaches(raw)
+        if not raw.empty and pd.to_datetime(raw['time_str'], format='mixed', errors='coerce', utc=True).notna().sum() == 0:
+            raise ValueError('Hydrocron returned no parseable observation dates')
         existing_times = set(existing["time_utc"].astype(str))
         incoming_times = set(incoming["time_utc"].astype(str))
         novel_count = len(incoming_times - existing_times)
@@ -200,18 +241,38 @@ def update_one_reach(
         # may revise an already-known timestamp; novelty alone is not enough
         # to decide whether the CSV changed.
         final = merge_reaches(existing, incoming)
+        if discharge is not None:
+            discharge = discharge.loc[pd.to_datetime(discharge.time_utc, utc=True) <= end]
+        final = merge_discharge(final, discharge)
         encoded = csv_bytes(final)
         empty_bytes = csv_bytes(pd.DataFrame(columns=REACH_OUTPUT_COLUMNS))
         changed = encoded != (previous_bytes or empty_bytes)
         if changed and (previous_bytes is not None or not final.empty):
             upload_bytes(container, blob, encoded, "text/csv; charset=utf-8")
+        chart_changed = False
+        chart_revision = ''
+        if properties.get('chart_url'):
+            chart_blob = chart_blob_path(properties['chart_url'], blob)
+            chart = final[['time_utc', 'wse', 'width', 'consensus_q']].copy()
+            chart['slope_cm_per_km'] = pd.to_numeric(final['slope'], errors='coerce') * 100000
+            chart_bytes = csv_bytes(chart[['time_utc','wse','slope_cm_per_km','width','consensus_q']])
+            chart_revision = hashlib.sha256(chart_bytes).hexdigest()[:16]
+            chart_changed = download_blob(container, chart_blob) != chart_bytes
+            if chart_changed:
+                upload_bytes(container, chart_blob, chart_bytes, 'text/csv; charset=utf-8')
         first, last = observation_bounds(final)
         return ReachResult(
-            reach_id, "success_with_data" if changed else "success_no_data",
+            reach_id, "success_with_data" if changed else ("success_no_data" if len(final) or response.status_code != 400 else "not_found"),
             start_text, query_end_utc, input_rows=len(raw), previous_rows=len(existing),
             final_rows=len(final), first_observation_utc=first,
             latest_observation_utc=last, blob_changed=changed,
-            message=f"novel_timestamps={novel_count}",
+            message=(response.text[:400] if response.status_code == 400 else f"novel_timestamps={novel_count}"),
+            discharge_count=int(final['consensus_q'].notna().sum()),
+            chart_changed=chart_changed,
+            content_revision=hashlib.sha256(encoded).hexdigest()[:16],
+            source_latest_utc=latest_observation(incoming) or '',
+            chart_revision=chart_revision,
+            stored_hydrocron_latest_utc=latest_observation(final.loc[final[['wse','slope','width','reach_q']].notna().any(axis=1)]) or '',
         )
     except Exception as exc:
         return ReachResult(reach_id, "retryable_failure", start_text, query_end_utc, message=str(exc)[:1000])
@@ -301,6 +362,16 @@ def update_reach_region(
     if not records:
         raise RuntimeError(f"No reach IDs for {region_id}")
 
+    prior_dawg_revisions = previous_state.get('dawg_revisions', {})
+    selection_hash = hashlib.sha256('\n'.join(sorted(blob_by_id)).encode()).hexdigest()
+    # A newly selected reach needs discharge even if the continental file did
+    # not change. Older states are refreshed once to establish this signature.
+    applied_revisions = (prior_dawg_revisions if previous_state.get('dawg_selection_hash') == selection_hash else {})
+    dawg_rows, dawg_revisions, missing_dawg = refresh_rows(
+        container, load_json(container, 'reference/dawg/current.json'),
+        applied_revisions, list(blob_by_id),
+    )
+
     upload_json(container, diagnostic_blob, {
         "region_id": region_id, "phase": "updating_reach_csvs",
         "run_end_utc": end_text, "reach_count": len(records),
@@ -313,6 +384,7 @@ def update_reach_region(
                 update_one_reach, container=container, properties=props, blob=blob,
                 query_end_utc=end_text, overlap_hours=overlap_hours,
                 query_start_utc=retry_starts.get(clean_id(props.get('reach_id', ''))) or successful_end,
+                discharge=dawg_rows.get(clean_id(props.get('reach_id', ''))),
                 backfill_days_if_empty=backfill_days_if_empty,
                 timeout=timeout, retries=retries,
             ) for props, blob in records[offset:offset + batch_size]]
@@ -332,28 +404,28 @@ def update_reach_region(
         result = by_id.get(clean_id(props.get("reach_id", "")))
         if not result or result.status == "retryable_failure":
             continue
-        before = (
-            props.get("observation_count"), props.get("has_data"),
-            props.get("first_observation_utc"), props.get("latest_observation_utc"),
-            props.get("url"),
-        )
+        before = dict(props)
         props["observation_count"] = result.final_rows
         props["has_data"] = result.final_rows > 0
         props["first_observation_utc"] = result.first_observation_utc or None
         props["latest_observation_utc"] = result.latest_observation_utc or None
+        props['has_discharge'] = result.discharge_count > 0
+        props['discharge_count'] = result.discharge_count
         if result.final_rows:
             props["url"] = (
                 f"https://{AZURE_ACCOUNT}.blob.core.windows.net/{AZURE_CONTAINER}/"
                 f"{blob_by_id[result.reach_id]}"
             )
+            if result.content_revision:
+                props['url'] += '?v=' + result.content_revision
+            if 'URL' in props:
+                props['URL'] = props['url']
         else:
             props.pop("url", None)
-        after = (
-            props.get("observation_count"), props.get("has_data"),
-            props.get("first_observation_utc"), props.get("latest_observation_utc"),
-            props.get("url"),
-        )
-        geometry_changed |= before != after
+            props.pop('URL', None)
+        if props.get('chart_url') and result.chart_revision:
+            props['chart_url'] = props['chart_url'].split('?')[0] + '?v=' + result.chart_revision
+        geometry_changed |= before != props
 
     ckan_updated = False
     if geometry_changed:
@@ -396,9 +468,9 @@ def update_reach_region(
     )
     counts = Counter(item.status for item in results)
     summary = {
-        "schema_version": 3, "region_id": region_id, "run_id": run_id,
+        "schema_version": 4, "region_id": region_id, "run_id": run_id,
         "previous_successful_end_utc": successful_end,
-        "query_policy": "successful_run_endpoint_no_overlap",
+        "query_policy": "earlier_of_successful_run_and_stored_hydrocron_no_overlap",
         "run_end_utc": end_text, "reach_count": len(records),
         "batch_size": batch_size,
         "batch_count": (len(records) + batch_size - 1) // batch_size,
@@ -409,13 +481,29 @@ def update_reach_region(
         "changed_csvs": sum(item.blob_changed for item in results),
         "retry_queue_size": counts.get("retryable_failure", 0),
         "geometry_updated": geometry_changed, "ckan_updated": ckan_updated,
+        "changed_chart_csvs": sum(item.chart_changed for item in results),
+        "source_rows_received": sum(item.input_rows for item in results),
+        "latest_source_observation_utc": max((item.source_latest_utc for item in results), default='') or None,
+        "latest_stored_hydrocron_observation_utc": max((item.stored_hydrocron_latest_utc for item in results), default='') or None,
+        "query_start_min_utc": min((item.query_start_utc for item in results if item.query_start_utc), default=None),
+        "dawg_status": "missing_continental_reference" if missing_dawg else "available",
+        "dawg_missing_continents": missing_dawg,
+        "dawg_refreshed_reaches": len(dawg_rows),
+        "dawg_revisions": dawg_revisions,
     }
+    summary['data_update_outcome'] = ('incomplete' if counts.get('retryable_failure', 0) else
+                                      'updated' if summary['changed_csvs'] else 'no_csv_changes')
+    summary['no_change_reason'] = ('Source responses produced no changes to stored CSVs; '
+                                   'a successful check does not imply new measurements.'
+                                   if not summary['changed_csvs'] else None)
     upload_json(container, f"regions/{region_id}/logs/reach_update_latest.json", summary)
     upload_json(container, f"regions/{region_id}/state/reach_update.json", {
-        "schema_version": 3, "region_id": region_id, "last_run_id": run_id,
+        "schema_version": 4, "region_id": region_id, "last_run_id": run_id,
         "last_successful_end_utc": end_text if not counts.get('retryable_failure', 0) else successful_end,
         "updated_utc": utc_text(utc_now()), "per_reach_csv_watermarks": False,
-        "query_policy": "successful_run_endpoint_no_overlap",
+        "query_policy": "earlier_of_successful_run_and_stored_hydrocron_no_overlap",
+        "dawg_revisions": prior_dawg_revisions if counts.get('retryable_failure', 0) else dawg_revisions,
+        "dawg_selection_hash": previous_state.get('dawg_selection_hash') if counts.get('retryable_failure', 0) else selection_hash,
         "retry_reaches": [asdict(item) for item in results if item.status == "retryable_failure"],
     })
     upload_json(container, diagnostic_blob, {
