@@ -25,12 +25,32 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 from urllib.parse import quote_plus
 
-import geopandas as gpd
 import pandas as pd
 import requests
 from azure.core.exceptions import ResourceExistsError
 from azure.storage.blob import ContainerClient, ContentSettings
 from pandas.errors import EmptyDataError
+
+# Airflow's scheduler imports every Python file below its DAG directory.  Keep
+# the native geospatial stack lazy so DAG parsing and inbox discovery do not
+# require GeoPandas in the scheduler process.  Provisioning workers still need
+# geopandas and pyogrio (or another GDAL-backed GeoPandas engine).
+gpd = None
+
+
+def require_geopandas():
+    global gpd
+    if gpd is None:
+        try:
+            import geopandas as geopandas_module
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "Regional provisioning requires geopandas and pyogrio in the "
+                "Airflow worker image. Install the repository requirements "
+                "before running the provision task."
+            ) from exc
+        gpd = geopandas_module
+    return gpd
 
 
 # ---- embedded pipeline implementation ----
@@ -102,6 +122,7 @@ def apply_quality_filter(frame: pd.DataFrame) -> tuple[pd.DataFrame, Counter[str
 DEFAULT_REFERENCE_ROOT = 'https://ihpwinsdata.blob.core.windows.net/swot/reference/sword/v17b'
 
 def select_layer(aoi_geometry, url: str) -> gpd.GeoDataFrame:
+    require_geopandas()
     candidates = gpd.read_file(url, bbox=tuple(aoi_geometry.bounds))
     if candidates.empty:
         return candidates
@@ -267,6 +288,7 @@ def add_timeseries_properties(frame: gpd.GeoDataFrame, product: str, results: li
     return output
 
 def write_geojson(frame: gpd.GeoDataFrame, destination: Path) -> None:
+    require_geopandas()
     destination.parent.mkdir(parents=True, exist_ok=True)
     payload = json.loads(frame.to_json(drop_id=True, to_wgs84=True))
     destination.write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
@@ -295,6 +317,7 @@ def upload_file(container: ContainerClient, region_id: str, source: Path, blob: 
 
 def run_historical_aoi_pipeline(*, aoi: str, region_id: str, display_name: str, continent: str='NA', output_root: str='output', start: str=DEFAULT_START, end: str | None=None, workers: int=8, timeout: int=60, retries: int=5, upload: bool=False, overwrite_local: bool=False, overwrite_azure: bool=False, connection_string_env: str='AZURE_STORAGE_CONNECTION_STRING', limit_reaches: int | None=None, limit_nodes: int | None=None, select_only: bool=False, dawg_file: str | None=None, register_manifest: bool=True) -> dict[str, Any]:
     """Run the historical pipeline; suitable for an Airflow PythonOperator."""
+    require_geopandas()
     region_id = validate_region_id(region_id)
     if not 1 <= workers <= 32:
         raise ValueError('workers must be between 1 and 32')
@@ -688,6 +711,7 @@ def _extract_aoi(downloaded: Path, directory: Path) -> Path:
     return shapefiles[0]
 
 def detect_continent(aoi_path: Path) -> tuple[str, dict[str, int]]:
+    require_geopandas()
     frame = gpd.read_file(aoi_path)
     if frame.empty or frame.crs is None:
         raise ValueError('AOI must contain geometry and have a defined CRS')
