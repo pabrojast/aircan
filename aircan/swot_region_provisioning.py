@@ -374,9 +374,9 @@ def run_historical_aoi_pipeline(*, aoi: str, region_id: str, display_name: str, 
             singular = 'reach' if item.product == 'reaches' else 'node'
             plans.append((Path(item.output_csv), f'regions/{region_id}/{item.product}/timeseries/{singular}_{item.feature_id}.csv'))
     if upload:
-        connection_string = os.environ.get(connection_string_env, '').strip()
+        connection_string = runtime_secret(connection_string_env)
         if not connection_string:
-            raise ValueError(f'Environment variable {connection_string_env!r} is empty')
+            raise ValueError(f'Airflow Variable or environment variable {connection_string_env!r} is empty')
         container = ContainerClient.from_connection_string(connection_string, AZURE_CONTAINER)
         if container.account_name != AZURE_ACCOUNT:
             raise ValueError(f'Refusing unexpected Azure account {container.account_name!r}')
@@ -524,7 +524,7 @@ def _upload(container: ContainerClient, blob: str, path: Path) -> None:
 
 def publish_region(root: Path, display_name: str | None=None, region_id: str | None=None, dataset: str=DATASET, ckan_api_key: str | None=None, connection_string: str | None=None) -> dict[str, Any]:
     key = (ckan_api_key or os.environ.get('CKAN_API_KEY', '')).strip()
-    connection = (connection_string or os.environ.get('AZURE_STORAGE_CONNECTION_STRING', '')).strip()
+    connection = (connection_string or runtime_secret('AZURE_STORAGE_CONNECTION_STRING')).strip()
     if not key or not connection:
         raise RuntimeError('CKAN_API_KEY and AZURE_STORAGE_CONNECTION_STRING are required')
     manifest_path = root / 'manifest.json'
@@ -595,10 +595,21 @@ SUPPORTED_SUFFIXES = {'.geojson', '.json', '.gpkg', '.kml', '.zip'}
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
+def runtime_secret(name: str) -> str:
+    """Read an Airflow Variable in tasks, with an environment fallback."""
+    try:
+        from airflow.models import Variable
+        value = str(Variable.get(name, default_var='')).strip()
+    except Exception:
+        value = os.environ.get(name, '').strip()
+    if value.startswith('"') and value.endswith('"'):
+        value = value[1:-1]
+    return value
+
 def get_container(connection_string_env: str='AZURE_STORAGE_CONNECTION_STRING') -> ContainerClient:
-    connection = os.environ.get(connection_string_env, '').strip()
+    connection = runtime_secret(connection_string_env)
     if not connection:
-        raise ValueError(f'Environment variable {connection_string_env!r} is empty')
+        raise ValueError(f'Airflow Variable or environment variable {connection_string_env!r} is empty')
     container = ContainerClient.from_connection_string(connection, AZURE_CONTAINER)
     if container.account_name != AZURE_ACCOUNT:
         raise ValueError(f'Refusing unexpected Azure account {container.account_name!r}')
