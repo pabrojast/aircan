@@ -453,8 +453,25 @@ def terria_config(region_id: str, display_name: str, kind: str, url: str, layer_
     cam = camera(layer_bounds)
     return {'version': '8.0.0', 'initSources': [{'stratum': 'user', 'models': {'/': {'members': [group_id], 'type': 'group'}, '__User-Added_Data__': {'members': [], 'knownContainerUniqueIds': ['/'], 'type': 'group'}, group_id: {'isOpen': True, 'members': [layer_id], 'name': f'{display_name} SWOT-SWORD {kind.title()}', 'knownContainerUniqueIds': ['/'], 'type': 'group'}, layer_id: {'type': 'geojson', 'name': f'{display_name} SWOT-SWORD {kind.title()} (click to chart)', 'url': url, 'cacheDuration': '5m', 'show': True, 'isOpenInWorkbench': False, 'knownContainerUniqueIds': [group_id], 'featureInfoTemplate': {'name': f'{singular.title()} {{{{{singular}_id}}}}', 'template': chart_html(kind)}, 'style': style, 'perPropertyStyles': [{'properties': {prop: True}, 'style': styled('#159D95' if kind == 'nodes' else '#1e6091')}, {'properties': {prop: False}, 'style': styled('#7B8490' if kind == 'nodes' else '#a67c52')}]}}, 'workbench': [layer_id], 'timeline': [], 'initialCamera': cam, 'homeCamera': cam, 'viewerMode': '2d', 'settings': {'baseMapId': 'basemap-openstreetmap', 'baseMaximumScreenSpaceError': 2, 'useNativeResolution': False, 'alwaysShowTimeline': False}, 'stories': []}]}
 
-def api(session: requests.Session, action: str, data: dict[str, Any], files=None, timeout: int=900) -> Any:
-    response = session.post(f'{CKAN}/api/3/action/{action}', data=data, files=files, timeout=timeout)
+def api(session: requests.Session, action: str, data: dict[str, Any], files=None,
+        timeout: int=900, attempts: int=6) -> Any:
+    """Call CKAN with bounded backoff for proxy throttling and outages."""
+    response = None
+    for attempt in range(attempts):
+        # requests consumes upload streams. Rewind them before a retry so a
+        # throttled upload is never resent as an empty file.
+        for value in (files or {}).values():
+            if isinstance(value, tuple) and len(value) > 1 and hasattr(value[1], 'seek'):
+                value[1].seek(0)
+        response = session.post(f'{CKAN}/api/3/action/{action}', data=data,
+                                files=files, timeout=timeout)
+        if response.status_code not in {429, 500, 502, 503, 504} or attempt + 1 == attempts:
+            break
+        retry_after = str(response.headers.get('Retry-After') or '').strip()
+        delay = float(retry_after) if retry_after.replace('.', '', 1).isdigit() else min(120.0, 10.0 * 2 ** attempt)
+        response.close()
+        time.sleep(delay + random.uniform(0, 1))
+    assert response is not None
     response.raise_for_status()
     payload = response.json()
     if not payload.get('success'):
@@ -523,7 +540,7 @@ def _upload(container: ContainerClient, blob: str, path: Path) -> None:
     container.get_blob_client(blob).upload_blob(path.read_bytes(), overwrite=True, content_settings=ContentSettings(content_type=media))
 
 def publish_region(root: Path, display_name: str | None=None, region_id: str | None=None, dataset: str=DATASET, ckan_api_key: str | None=None, connection_string: str | None=None) -> dict[str, Any]:
-    key = (ckan_api_key or os.environ.get('CKAN_API_KEY', '')).strip()
+    key = (ckan_api_key or runtime_secret('IHP_WINS_CKAN_API_KEY') or runtime_secret('CKAN_API_KEY')).strip()
     connection = (connection_string or runtime_secret('AZURE_STORAGE_CONNECTION_STRING')).strip()
     if not key or not connection:
         raise RuntimeError('CKAN_API_KEY and AZURE_STORAGE_CONNECTION_STRING are required')
