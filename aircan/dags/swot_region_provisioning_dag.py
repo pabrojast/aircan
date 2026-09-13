@@ -34,7 +34,9 @@ def swot_region_provisioning():
     @task
     def discover() -> list[dict[str, str]]:
         from swot_region_provisioning import discover_submissions
-        return discover_submissions(submission_filter=setting("SWOT_PROVISION_SUBMISSION_FILTER", "") or None)
+        # The pending inbox is already an explicit work queue. Do not silently
+        # suppress valid submissions through a stale deployment filter.
+        return discover_submissions()
 
     @task(pool="swot_hydrocron", max_active_tis_per_dag=1,
           execution_timeout=timedelta(hours=24))
