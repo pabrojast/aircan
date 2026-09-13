@@ -209,6 +209,13 @@ def normalize_reaches(frame: pd.DataFrame) -> pd.DataFrame:
     for column in REACH_OUTPUT_COLUMNS:
         if column not in output:
             output[column] = pd.NA
+    # Hydrocron represents missing RiverSP measurements with extreme numeric
+    # sentinels (commonly -999999999999). They must be blanked before storage;
+    # otherwise Terria charts them as enormous real values.
+    for column in ('wse', 'slope', 'width', 'area_total', 'dschg_gm',
+                   'dschg_gm_q', 'reach_q', 'reach_q_b', 'consensus_q'):
+        values = pd.to_numeric(output[column], errors='coerce')
+        output[column] = values.mask(values.abs().ge(FILL_ABS_THRESHOLD))
     return output[REACH_OUTPUT_COLUMNS].drop_duplicates(['reach_id', 'time_utc', 'cycle_id', 'pass_id'], keep='last').sort_values('time_utc').reset_index(drop=True)
 
 def atomic_csv(frame: pd.DataFrame, destination: Path) -> None:
@@ -674,14 +681,31 @@ def discover_submissions(connection_string_env: str='AZURE_STORAGE_CONNECTION_ST
     container = get_container(connection_string_env)
     allowed = {item.strip() for item in (submission_filter or '').split(',') if item.strip()}
     found = []
-    for blob in container.list_blobs(name_starts_with=PENDING_PREFIX):
+    pending = list(container.list_blobs(name_starts_with=PENDING_PREFIX))
+    for blob in pending:
         if not blob.name.endswith('.submission.json'):
             continue
         sid = submission_id(blob.name)
         if allowed and sid not in allowed:
             continue
         found.append({'submission_id': sid, 'metadata_blob': blob.name})
-    return sorted(found, key=lambda item: item['submission_id'])
+    found = sorted(found, key=lambda item: item['submission_id'])
+    # Airflow task logs are not consistently available in this deployment.
+    # Persist a safe discovery receipt so empty dynamic maps are diagnosable.
+    audit = {
+        'schema_version': 1,
+        'checked_utc': utc_now(),
+        'account': container.account_name,
+        'container': AZURE_CONTAINER,
+        'pending_prefix': PENDING_PREFIX,
+        'pending_blobs': [blob.name for blob in pending],
+        'submission_filter': sorted(allowed),
+        'matched_submissions': found,
+    }
+    container.get_blob_client('incoming/logs/discovery_latest.json').upload_blob(
+        json.dumps(audit, ensure_ascii=False, indent=2).encode(), overwrite=True,
+        content_settings=ContentSettings(content_type='application/json; charset=utf-8'))
+    return found
 
 def _download(container: ContainerClient, blob: str, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
