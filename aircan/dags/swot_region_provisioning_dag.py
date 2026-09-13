@@ -17,7 +17,12 @@ def setting(name: str, default: str) -> str:
 
 
 def ckan_api_key() -> str:
-    value = str(Variable.get("CKAN_API_KEY")).strip()
+    # Match the proven reach publisher. The project-specific credential is
+    # authoritative; a stale generic CKAN_API_KEY must not shadow it.
+    value = str(Variable.get(
+        "IHP_WINS_CKAN_API_KEY",
+        default_var=Variable.get("CKAN_API_KEY", default_var=""),
+    )).strip()
     return value[1:-1] if value.startswith('"') and value.endswith('"') else value
 
 
