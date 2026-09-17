@@ -1077,6 +1077,7 @@ def provision_submission(*, descriptor: dict[str, str], workers: int=8, timeout:
                     'source_dataset_id': source_intake.get('dataset_id'),
                     'source_resource_id': source_intake['resource_id'],
                     'source_sha256': source_intake.get('sha256'),
+                    'source_last_modified': source_intake.get('last_modified'),
                     'display_name': submission['display_name'],
                     'region_id': submission['region_id'],
                     'destination_dataset_name': destination['name'],
