@@ -28,7 +28,7 @@ def ckan_api_key() -> str:
 
 @dag(dag_id="swot_region_provisioning", schedule_interval="*/30 * * * *",
      start_date=datetime(2026, 9, 9), catchup=False, max_active_runs=1,
-     default_args={"owner": "airflow", "retries": 0, "retry_delay": timedelta(minutes=15)},
+     default_args={"owner": "airflow", "retries": 2, "retry_delay": timedelta(minutes=15)},
      tags=["swot", "provisioning", "aoi", "azure", "ckan", "unesco"])
 def swot_region_provisioning():
     @task
