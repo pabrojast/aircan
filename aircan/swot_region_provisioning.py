@@ -108,6 +108,32 @@ def select_layer(aoi_geometry, url: str) -> gpd.GeoDataFrame:
     candidates = candidates.to_crs('EPSG:4326')
     return candidates.loc[candidates.geometry.intersects(aoi_geometry)].copy()
 
+def select_global_layer(aoi_geometry, kind: str) -> tuple[gpd.GeoDataFrame, dict[str, int]]:
+    """Select an AOI from the complete partitioned SWORD reference.
+
+    The Azure reference is global but intentionally stored as continental
+    FlatGeobuf partitions so HTTP range reads remain small.  Querying every
+    partition also handles AOIs that cross a continental boundary.
+    """
+    id_field = 'reach_id' if kind == 'reaches' else 'node_id'
+    frames: list[gpd.GeoDataFrame] = []
+    counts: dict[str, int] = {}
+    for continent_code in CONTINENTS:
+        selected = select_layer(
+            aoi_geometry,
+            f'{DEFAULT_REFERENCE_ROOT}/{kind}/{continent_code}.fgb',
+        )
+        counts[continent_code] = len(selected)
+        if not selected.empty:
+            selected = selected.copy()
+            selected['reference_partition'] = continent_code
+            frames.append(selected)
+    if not frames:
+        return gpd.GeoDataFrame(geometry=[], crs='EPSG:4326'), counts
+    merged = gpd.GeoDataFrame(pd.concat(frames, ignore_index=True), crs='EPSG:4326')
+    merged[id_field] = merged[id_field].map(clean_id)
+    return merged.drop_duplicates(id_field).reset_index(drop=True), counts
+
 AZURE_ACCOUNT = 'ihpwinsdata'
 
 AZURE_HOST = f'{AZURE_ACCOUNT}.blob.core.windows.net'
@@ -271,6 +297,20 @@ def add_timeseries_properties(frame: gpd.GeoDataFrame, product: str, results: li
     output['url'] = output.apply(lambda row: f'{base}/{singular}_{row[id_field]}.csv' if row['has_data'] else None, axis=1)
     output['hydrocron_collection'] = COLLECTION
     output['sword_version'] = 'v17b'
+    first_by_id: dict[str, str] = {}
+    latest_by_id: dict[str, str] = {}
+    for item in results:
+        if not item.output_csv or item.accepted_rows <= 0:
+            continue
+        try:
+            times = pd.to_datetime(pd.read_csv(item.output_csv, usecols=['time_utc'])['time_utc'], utc=True, errors='coerce').dropna()
+        except (FileNotFoundError, EmptyDataError, ValueError):
+            continue
+        if not times.empty:
+            first_by_id[item.feature_id] = times.min().strftime('%Y-%m-%dT%H:%M:%SZ')
+            latest_by_id[item.feature_id] = times.max().strftime('%Y-%m-%dT%H:%M:%SZ')
+    output['first_observation_utc'] = output[id_field].map(first_by_id)
+    output['latest_observation_utc'] = output[id_field].map(latest_by_id)
     return output
 
 def write_geojson(frame: gpd.GeoDataFrame, destination: Path) -> None:
@@ -318,8 +358,17 @@ def run_historical_aoi_pipeline(*, aoi: str, region_id: str, display_name: str, 
     mask = aoi_frame.geometry.union_all()
     reference = DEFAULT_REFERENCE_ROOT.rstrip('/')
     continent = continent.upper()
-    reaches = select_layer(mask, f'{reference}/reaches/{continent}.fgb')
-    nodes = select_layer(mask, f'{reference}/nodes/{continent}.fgb')
+    if continent in {'AUTO', 'GLOBAL'}:
+        reaches, reach_partition_counts = select_global_layer(mask, 'reaches')
+        nodes, node_partition_counts = select_global_layer(mask, 'nodes')
+        continent = 'GLOBAL'
+    else:
+        reaches = select_layer(mask, f'{reference}/reaches/{continent}.fgb')
+        nodes = select_layer(mask, f'{reference}/nodes/{continent}.fgb')
+        reach_partition_counts = {continent: len(reaches)}
+        node_partition_counts = {continent: len(nodes)}
+    if reaches.empty:
+        raise ValueError('AOI does not intersect any SWORD v17b reaches')
     reaches['reach_id'] = reaches['reach_id'].map(clean_id)
     nodes['node_id'] = nodes['node_id'].map(clean_id)
     reaches = reaches.drop_duplicates('reach_id')
@@ -367,7 +416,12 @@ def run_historical_aoi_pipeline(*, aoi: str, region_id: str, display_name: str, 
     node_geojson = root / 'nodes' / 'nodes.geojson'
     write_geojson(reach_layer, reach_geojson)
     write_geojson(node_layer, node_geojson)
-    summary: dict[str, Any] = {'schema_version': 1, 'region_id': region_id, 'display_name': display_name, 'run_started_utc': run_started, 'run_finished_utc': utc_now(), 'window': {'start': start, 'end': end}, 'hydrocron_collection': COLLECTION, 'sword_version': 'v17b', 'continent_layer': continent, 'reaches': {'selected': len(reaches), 'with_data': int(reach_layer.has_data.sum()), 'observations': sum((item.accepted_rows for item in reach_results)), 'statuses': dict(Counter((item.status for item in reach_results)))}, 'nodes': {'selected': len(nodes), 'with_data': int(node_layer.has_data.sum()), 'observations': sum((item.accepted_rows for item in node_results)), 'statuses': dict(Counter((item.status for item in node_results)))}, 'dawg': dawg_summary, 'node_quality_filter': {'ice_clim_f': '== 0', 'node_q': '< 3', 'xovr_cal_q': '< 2', 'wse': 'finite non-fill', 'node_q_b_bits_unset_zero_based': [13, 14, 19, 23]}, 'azure': {'account': AZURE_ACCOUNT, 'container': AZURE_CONTAINER, 'prefix': f'regions/{region_id}/', 'uploaded': False}}
+    transient_statuses = {'error', 'http_429', 'http_500', 'http_502', 'http_503', 'http_504'}
+    unresolved = [item for item in result_rows if item.status in transient_statuses]
+    if unresolved:
+        sample = ', '.join(f'{item.product}:{item.feature_id}:{item.status}' for item in unresolved[:10])
+        raise RuntimeError(f'{len(unresolved)} transient Hydrocron requests remain unresolved: {sample}')
+    summary: dict[str, Any] = {'schema_version': 2, 'region_id': region_id, 'display_name': display_name, 'run_started_utc': run_started, 'run_finished_utc': utc_now(), 'window': {'start': start, 'end': end}, 'hydrocron_collection': COLLECTION, 'sword_version': 'v17b', 'reference_scope': 'global_partitioned', 'reference_partition_counts': {'reaches': reach_partition_counts, 'nodes': node_partition_counts}, 'reaches': {'selected': len(reaches), 'with_data': int(reach_layer.has_data.sum()), 'observations': sum((item.accepted_rows for item in reach_results)), 'statuses': dict(Counter((item.status for item in reach_results)))}, 'nodes': {'selected': len(nodes), 'with_data': int(node_layer.has_data.sum()), 'observations': sum((item.accepted_rows for item in node_results)), 'statuses': dict(Counter((item.status for item in node_results)))}, 'dawg': dawg_summary, 'node_quality_filter': {'ice_clim_f': '== 0', 'node_q': '< 3', 'xovr_cal_q': '< 2', 'wse': 'finite non-fill', 'node_q_b_bits_unset_zero_based': [13, 14, 19, 23]}, 'azure': {'account': AZURE_ACCOUNT, 'container': AZURE_CONTAINER, 'prefix': f'regions/{region_id}/', 'uploaded': False}}
     summary_path = root / 'run_summary.json'
     summary_path.write_text(json.dumps(summary, indent=2), encoding='utf-8')
     manifest = {'schema_version': 1, 'region_id': region_id, 'display_name': display_name, 'status': 'historical_built', 'aoi_blob': f'regions/{region_id}/source/aoi.geojson', 'products': {'reaches': {'geometry_blob': f'regions/{region_id}/reaches/reaches.geojson', 'timeseries_prefix': f'regions/{region_id}/reaches/timeseries/', 'filename': 'reach_{reach_id}.csv'}, 'nodes': {'geometry_blob': f'regions/{region_id}/nodes/nodes.geojson', 'timeseries_prefix': f'regions/{region_id}/nodes/timeseries/', 'filename': 'node_{node_id}.csv'}}, 'historical_summary': summary}
@@ -485,6 +539,14 @@ def api(session: requests.Session, action: str, data: dict[str, Any], files=None
         raise RuntimeError(json.dumps(payload, ensure_ascii=False))
     return payload['result']
 
+def api_json(session: requests.Session, action: str, payload: dict[str, Any], timeout: int=180) -> Any:
+    response = session.post(f'{CKAN}/api/3/action/{action}', json=payload, timeout=timeout)
+    response.raise_for_status()
+    body = response.json()
+    if not body.get('success'):
+        raise RuntimeError(json.dumps(body, ensure_ascii=False))
+    return body['result']
+
 def publish_resource(session: requests.Session, dataset: str, name: str, description: str, path: Path, resource_id: str | None=None) -> dict[str, Any]:
     package = api(session, 'package_show', {'id': dataset})
     (resources, selected) = (package.get('resources', []), None)
@@ -502,6 +564,24 @@ def publish_resource(session: requests.Session, dataset: str, name: str, descrip
     with path.open('rb') as handle:
         return api(session, 'resource_update' if selected else 'resource_create', data, {'upload': (path.name, handle, 'application/geo+json')})
 
+def publish_url_resource(session: requests.Session, dataset: str, name: str,
+                         description: str, url: str,
+                         resource_id: str | None=None) -> dict[str, Any]:
+    """Create or update a CKAN resource that points at a stable Azure object."""
+    package = api(session, 'package_show', {'id': dataset})
+    resources = package.get('resources', [])
+    selected = next((item for item in resources if item.get('id') == resource_id), None) if resource_id else None
+    if resource_id and not selected:
+        raise ValueError(f'Configured CKAN resource {resource_id} is not in dataset {dataset}')
+    if not selected:
+        matches = [item for item in resources if str(item.get('name') or '').casefold() == name.casefold()]
+        if len(matches) > 1:
+            raise RuntimeError(f"Duplicate resources named {name}: {[item['id'] for item in matches]}")
+        selected = matches[0] if matches else None
+    data = {'name': name, 'description': description, 'format': 'GeoJSON', 'url': url, 'url_type': ''}
+    data['id' if selected else 'package_id'] = selected['id'] if selected else package['id']
+    return api(session, 'resource_update' if selected else 'resource_create', data)
+
 def publish_view(session: requests.Session, resource_id: str, title: str, description: str, viewer_url: str) -> dict[str, Any]:
     views = api(session, 'resource_view_list', {'id': resource_id})
     existing = next((view for view in views if view.get('view_type') == 'terria_view'), None)
@@ -509,6 +589,155 @@ def publish_view(session: requests.Session, resource_id: str, title: str, descri
     if existing:
         data['id'] = existing['id']
     return api(session, 'resource_view_update' if existing else 'resource_view_create', data)
+
+def publish_documentation(session: requests.Session, dataset: str, source: dict[str, Any]) -> dict[str, Any]:
+    package = api(session, 'package_show', {'id': dataset})
+    name = str(source.get('name') or 'SWOT-SWORD Regional Surface Water Data Guide')
+    existing = next((item for item in package.get('resources', [])
+                     if str(item.get('name') or '').casefold() == name.casefold()), None)
+    if existing:
+        return existing
+    first = session.get(str(source['url']), allow_redirects=False, timeout=120)
+    if first.status_code in {301, 302, 303, 307, 308}:
+        location = first.headers.get('Location')
+        if not location:
+            raise RuntimeError('Documentation download redirect had no Location header')
+        downloaded = requests.get(location, timeout=120)
+    else:
+        downloaded = first
+    downloaded.raise_for_status()
+    data = {
+        'package_id': dataset,
+        'name': name,
+        'description': 'Universal guide to the regional SWOT-SWORD reach and node products, schemas, processing, quality filtering, viewer use, and limitations.',
+        'format': 'PDF',
+    }
+    return api(session, 'resource_create', data, {
+        'upload': ('swot_sword_regional_data_guide.pdf', io.BytesIO(downloaded.content), 'application/pdf')
+    })
+
+def improve_dataset_metadata(session: requests.Session, dataset: str, root: Path,
+                             layer_bounds: dict[str, float]) -> dict[str, Any]:
+    manifest_path = root / 'manifest.json'
+    if manifest_path.exists():
+        summary = json.loads(manifest_path.read_text(encoding='utf-8'))['historical_summary']
+    elif (root / 'run_summary.json').exists():
+        summary = json.loads((root / 'run_summary.json').read_text(encoding='utf-8'))
+    else:
+        summary = json.loads((root / 'logs' / 'historical_summary.json').read_text(encoding='utf-8'))
+    observed_starts: list[pd.Timestamp] = []
+    for kind in ('reaches', 'nodes'):
+        path = root / kind / f'{kind}.geojson'
+        if not path.exists():
+            continue
+        payload = json.loads(path.read_text(encoding='utf-8'))
+        for feature in payload.get('features', []):
+            value = (feature.get('properties') or {}).get('first_observation_utc')
+            parsed = pd.to_datetime(value, utc=True, errors='coerce')
+            if pd.notna(parsed):
+                observed_starts.append(parsed)
+    start = min(observed_starts).strftime('%Y-%m-%d') if observed_starts else str(summary['window']['start'])[:10]
+    bbox = {
+        'type': 'Polygon',
+        'coordinates': [[
+            [layer_bounds['west'], layer_bounds['south']],
+            [layer_bounds['east'], layer_bounds['south']],
+            [layer_bounds['east'], layer_bounds['north']],
+            [layer_bounds['west'], layer_bounds['north']],
+            [layer_bounds['west'], layer_bounds['south']],
+        ]],
+    }
+    dawg_note = (' Reach-scale DAWG consensus discharge is included where available.'
+                 if summary.get('dawg') else '')
+    provenance = (
+        'Automatically generated from a researcher-supplied area of interest. '
+        'The AOI selects intersecting SWORD v17b reaches and nodes. Historical '
+        'SWOT RiverSP Version D observations are retrieved through Hydrocron, '
+        'quality-filtered, normalized, and stored as per-feature CSV files.' + dawg_note
+    )
+    purpose = (
+        'Provide an experimental, reproducible regional view of SWOT river '
+        'observations for scientific exploration, screening, and research.'
+    )
+    lineage = [
+        'https://podaac.jpl.nasa.gov/dataset/SWOT_L2_HR_RiverSP_D',
+        'https://podaac.github.io/hydrocron/',
+        'https://zenodo.org/records/15299138',
+    ]
+    if summary.get('dawg'):
+        lineage.append('https://podaac.jpl.nasa.gov/dataset/SWOT_L4_DAWG_SOS_DISCHARGE_V3')
+    return api_json(session, 'package_patch', {
+        'id': dataset,
+        'tags': [{'name': value} for value in
+                 ('SWOT', 'SWORD', 'surface water', 'river', 'time series', 'experimental')],
+        'theme': ['http://inspire.ec.europa.eu/theme/hy'],
+        'theme_eu': ['http://publications.europa.eu/resource/authority/data-theme/ENVI'],
+        'spatial': json.dumps(bbox, separators=(',', ':')),
+        'reference_system': 'http://www.opengis.net/def/crs/EPSG/0/4326',
+        'representation_type': 'http://inspire.ec.europa.eu/metadata-codelist/SpatialRepresentationType/vector',
+        'temporal_start': start,
+        'frequency': 'http://publications.europa.eu/resource/authority/frequency/DAILY',
+        'provenance': {'en': provenance, 'es': '', 'fr': ''},
+        'purpose': {'en': purpose, 'es': '', 'fr': ''},
+        'lineage_source': lineage,
+        'access_level': 'public',
+        'access_rights': 'http://inspire.ec.europa.eu/metadata-codelist/LimitationsOnPublicAccess/noLimitations',
+        'publisher_name': 'UNESCO Intergovernmental Hydrological Programme',
+        'publisher_type': 'http://purl.org/adms/publishertype/SupraNationalAuthority',
+        'version_notes': {
+            'en': 'Initial automatically provisioned experimental regional publication.',
+            'es': '',
+            'fr': '',
+        },
+    })
+
+def ensure_destination_dataset(session: requests.Session, submission: dict[str, Any]) -> dict[str, Any]:
+    """Return the requested regional dataset, creating it once when absent."""
+    requested_name = str(submission.get('destination_dataset_name') or '').strip()
+    requested_title = str(submission.get('destination_dataset_title') or '').strip()
+    if not requested_name or not requested_title:
+        # Backward compatibility for the original manually configured inbox.
+        return api(session, 'package_show', {'id': submission['dataset_id']})
+    description = (
+        f'Experimental SWOT RiverSP Version D time-series observations for '
+        f'{submission["display_name"]}, organized using SWORD v17b reaches and nodes. '
+        'This automatically generated research dataset is intended for exploration '
+        'and is not validated for operational or safety-critical decisions.'
+    )
+    try:
+        existing = api(session, 'package_show', {'id': requested_name})
+    except requests.HTTPError as exc:
+        if exc.response is None or exc.response.status_code != 404:
+            raise
+    else:
+        return api(session, 'package_patch', {
+            'id': existing['id'],
+            'title': requested_title,
+            'title_translated': json.dumps({'en': requested_title, 'es': '', 'fr': ''}),
+            'notes': description,
+            'notes_translated': json.dumps({'en': description, 'es': '', 'fr': ''}),
+            'version': 'Experimental',
+        })
+    data = {
+        'name': requested_name,
+        'identifier': requested_name,
+        'title': requested_title,
+        'title_translated': json.dumps({'en': requested_title, 'es': '', 'fr': ''}),
+        'owner_org': 'e3256cf0-328d-40fe-80f1-f2bcf0a466aa',
+        'contact_name': 'Trevor Wilkerson',
+        'contact_email': 'admin@saltosllc.com',
+        'publisher_name': 'UNESCO Intergovernmental Hydrological Programme',
+        'notes': description,
+        'notes_translated': json.dumps({'en': description, 'es': '', 'fr': ''}),
+        'license_id': 'cc-by-sa',
+        'version': 'Experimental',
+        'dataset_scope': 'spatial_dataset',
+        'dcat_type': 'http://inspire.ec.europa.eu/metadata-codelist/ResourceType/dataset',
+        'language': 'http://publications.europa.eu/resource/authority/language/ENG',
+        'topic': 'http://inspire.ec.europa.eu/metadata-codelist/TopicCategory/inlandWaters',
+        'access_level': 'public',
+    }
+    return api(session, 'package_create', data)
 
 def add_discharge(payload: dict[str, Any], csv_dir: Path, chart_dir: Path, region_id: str) -> None:
     chart_dir.mkdir(parents=True, exist_ok=True)
@@ -546,12 +775,40 @@ def _upload(container: ContainerClient, blob: str, path: Path) -> None:
     media = {'.json': 'application/json; charset=utf-8', '.geojson': 'application/geo+json; charset=utf-8', '.csv': 'text/csv; charset=utf-8', '.txt': 'text/plain; charset=utf-8'}.get(path.suffix.lower(), 'application/octet-stream')
     container.get_blob_client(blob).upload_blob(path.read_bytes(), overwrite=True, content_settings=ContentSettings(content_type=media))
 
-def publish_region(root: Path, display_name: str | None=None, region_id: str | None=None, dataset: str=DATASET, ckan_api_key: str | None=None, connection_string: str | None=None) -> dict[str, Any]:
+def publish_region(root: Path, display_name: str | None=None, region_id: str | None=None, dataset: str=DATASET, ckan_api_key: str | None=None, connection_string: str | None=None, documentation_source: dict[str, Any] | None=None) -> dict[str, Any]:
     key = (ckan_api_key or runtime_secret('IHP_WINS_CKAN_API_KEY') or runtime_secret('CKAN_API_KEY')).strip()
     connection = (connection_string or runtime_secret('AZURE_STORAGE_CONNECTION_STRING')).strip()
     if not key or not connection:
         raise RuntimeError('CKAN_API_KEY and AZURE_STORAGE_CONNECTION_STRING are required')
     manifest_path = root / 'manifest.json'
+    if not manifest_path.exists():
+        summary_path = root / 'logs' / 'historical_summary.json'
+        if not summary_path.exists():
+            raise FileNotFoundError(f'Neither {manifest_path} nor {summary_path} exists')
+        summary = json.loads(summary_path.read_text(encoding='utf-8'))
+        recovered_region = safe_region(region_id or str(summary['region_id']))
+        recovered_name = (display_name or str(summary['display_name'])).strip()
+        recovered_manifest = {
+            'schema_version': 1,
+            'region_id': recovered_region,
+            'display_name': recovered_name,
+            'status': 'historical_complete',
+            'aoi_blob': f'regions/{recovered_region}/source/aoi.geojson',
+            'products': {
+                'reaches': {
+                    'geometry_blob': f'regions/{recovered_region}/reaches/reaches.geojson',
+                    'timeseries_prefix': f'regions/{recovered_region}/reaches/timeseries/',
+                    'filename': 'reach_{reach_id}.csv',
+                },
+                'nodes': {
+                    'geometry_blob': f'regions/{recovered_region}/nodes/nodes.geojson',
+                    'timeseries_prefix': f'regions/{recovered_region}/nodes/timeseries/',
+                    'filename': 'node_{node_id}.csv',
+                },
+            },
+            'historical_summary': summary,
+        }
+        manifest_path.write_text(json.dumps(recovered_manifest, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
     region_id = safe_region(region_id or str(manifest['region_id']))
     display_name = (display_name or str(manifest['display_name'])).strip()
@@ -571,25 +828,45 @@ def publish_region(root: Path, display_name: str | None=None, region_id: str | N
         path = out / f'{region_id}_sword_{kind}_version_d.geojson'
         path.write_text(json.dumps(payload, ensure_ascii=False, separators=(',', ':')), encoding='utf-8')
         prepared[kind] = (path, bounds(payload))
+    geometry_blobs = {
+        'reaches': f'regions/{region_id}/reaches/reaches.geojson',
+        'nodes': f'regions/{region_id}/nodes/nodes.geojson',
+    }
+    for kind in ('reaches', 'nodes'):
+        _upload(container, geometry_blobs[kind], prepared[kind][0])
     session = requests.Session()
     session.headers.update({'Authorization': key, 'X-CKAN-API-Key': key})
     (results, id_keys) = ({}, {'reaches': 'reach_resource_id', 'nodes': 'node_resource_id'})
     for kind in ('reaches', 'nodes'):
         name = f'{display_name} SWOT-SWORD {kind.title()} (Version D)'
         description = f'SWORD v17b river {kind} in {display_name} linked to SWOT RiverSP Version D time series.'
-        resource = publish_resource(session, dataset, name, description, prepared[kind][0], previous_ckan.get(id_keys[kind]))
-        config = terria_config(region_id, display_name, kind, resource['url'], prepared[kind][1])
+        azure_url = f'https://{AZURE_ACCOUNT}.blob.core.windows.net/{AZURE_CONTAINER}/{geometry_blobs[kind]}'
+        resource = publish_url_resource(session, dataset, name, description, azure_url, previous_ckan.get(id_keys[kind]))
+        config = terria_config(region_id, display_name, kind, azure_url, prepared[kind][1])
         viewer = TERRIA + quote_plus(json.dumps(config, ensure_ascii=False, separators=(',', ':')))
         view = publish_view(session, resource['id'], f'{display_name} SWOT-SWORD {kind.title()} Explorer', description, viewer)
         (out / f'{kind}-terria.json').write_text(json.dumps(config, indent=2), encoding='utf-8')
         (out / f'{kind}-viewer-url.txt').write_text(viewer, encoding='utf-8')
         results[kind] = {'resource_id': resource['id'], 'resource_url': resource['url'], 'view_id': view['id'], 'resource_page': f"{CKAN}/dataset/{dataset}/resource/{resource['id']}"}
+    if documentation_source:
+        document = publish_documentation(session, dataset, documentation_source)
+        results['documentation'] = {
+            'resource_id': document['id'],
+            'resource_url': document['url'],
+            'resource_page': f"{CKAN}/dataset/{dataset}/resource/{document['id']}",
+        }
+    improve_dataset_metadata(session, dataset, root, prepared['reaches'][1])
     manifest['status'] = 'published'
+    for kind in ('reaches', 'nodes'):
+        manifest['products'][kind]['publication_mode'] = 'azure_url'
+        manifest['products'][kind]['enabled'] = True
     manifest['ckan'] = {'dataset_id': dataset, 'reach_resource_id': results['reaches']['resource_id'], 'node_resource_id': results['nodes']['resource_id']}
-    manifest['terria'] = {kind: {'view_id': result['view_id'], 'config_blob': f'regions/{region_id}/terria/{kind}.json', 'viewer_url_blob': f'regions/{region_id}/terria/{kind}-viewer-url.txt'} for (kind, result) in results.items()}
+    if 'documentation' in results:
+        manifest['ckan']['documentation_resource_id'] = results['documentation']['resource_id']
+    manifest['terria'] = {kind: {'view_id': results[kind]['view_id'], 'config_blob': f'regions/{region_id}/terria/{kind}.json', 'viewer_url_blob': f'regions/{region_id}/terria/{kind}-viewer-url.txt'} for kind in ('reaches', 'nodes')}
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding='utf-8')
     uploads = {f'regions/{region_id}/reaches/reaches.geojson': prepared['reaches'][0], f'regions/{region_id}/nodes/nodes.geojson': prepared['nodes'][0]}
-    for kind in results:
+    for kind in ('reaches', 'nodes'):
         uploads[f'regions/{region_id}/terria/{kind}.json'] = out / f'{kind}-terria.json'
         uploads[f'regions/{region_id}/terria/{kind}-viewer-url.txt'] = out / f'{kind}-viewer-url.txt'
     for path in chart_dir.glob('*.csv'):
@@ -770,8 +1047,8 @@ def provision_submission(*, descriptor: dict[str, str], workers: int=8, timeout:
     marker = PROCESSING_PREFIX + submission['submission_id'] + '.json'
     try:
         _upload_json(container, marker, {'submission_id': submission['submission_id'], 'region_id': submission['region_id'], 'started_utc': utc_now()}, overwrite=False)
-    except ResourceExistsError:
-        _upload_json(container, marker, {'submission_id': submission['submission_id'], 'region_id': submission['region_id'], 'restarted_utc': utc_now()})
+    except ResourceExistsError as exc:
+        raise RuntimeError(f'Submission {submission["submission_id"]} is already being processed') from exc
     try:
         with tempfile.TemporaryDirectory(prefix=f"swot-{submission['submission_id']}-") as temp:
             temp_path = Path(temp)
@@ -779,19 +1056,42 @@ def provision_submission(*, descriptor: dict[str, str], workers: int=8, timeout:
             _download(container, submission['aoi_blob'], downloaded)
             aoi_path = _extract_aoi(downloaded, temp_path)
             continent_counts = None
-            continent = submission['continent']
-            if continent == 'AUTO':
-                (continent, continent_counts) = detect_continent(aoi_path)
+            continent = 'GLOBAL' if submission['continent'] == 'AUTO' else submission['continent']
             output_root = temp_path / 'output'
             historical = run_historical_aoi_pipeline(aoi=str(aoi_path), region_id=submission['region_id'], display_name=submission['display_name'], continent=continent, output_root=str(output_root), start=submission['historical_start'], workers=workers, timeout=timeout, retries=retries, upload=True, overwrite_azure=True, register_manifest=False, connection_string_env=connection_string_env)
             root = output_root / submission['region_id'] / 'historical'
-            publication = publish_region(root, submission['display_name'], submission['region_id'], submission['dataset_id'], ckan_api_key=ckan_api_key)
+            key = (ckan_api_key or runtime_secret('IHP_WINS_CKAN_API_KEY') or runtime_secret('CKAN_API_KEY')).strip()
+            if not key:
+                raise RuntimeError('CKAN_API_KEY is required to create and publish the destination dataset')
+            ckan_session = requests.Session()
+            ckan_session.headers.update({'Authorization': key, 'X-CKAN-API-Key': key})
+            destination = ensure_destination_dataset(ckan_session, submission)
+            publication = publish_region(root, submission['display_name'], submission['region_id'], destination['id'], ckan_api_key=key, documentation_source=submission.get('documentation_source'))
+            publication['dataset_id'] = destination['id']
+            publication['dataset_name'] = destination['name']
             receipt = {'schema_version': 1, 'status': 'completed', 'submission_id': submission['submission_id'], 'region_id': submission['region_id'], 'completed_utc': utc_now(), 'continent': continent, 'continent_reach_counts': continent_counts, 'historical': historical, 'publication': publication}
+            source_intake = submission.get('source_intake') or {}
+            if source_intake.get('resource_id'):
+                _upload_json(container, f"incoming/registry/{source_intake['resource_id']}.json", {
+                    'schema_version': 1,
+                    'source_dataset_id': source_intake.get('dataset_id'),
+                    'source_resource_id': source_intake['resource_id'],
+                    'source_sha256': source_intake.get('sha256'),
+                    'display_name': submission['display_name'],
+                    'region_id': submission['region_id'],
+                    'destination_dataset_name': destination['name'],
+                    'destination_dataset_id': destination['id'],
+                    'completed_utc': receipt['completed_utc'],
+                })
             _archive(container, submission, 'completed', receipt)
             container.get_blob_client(marker).delete_blob()
             return receipt
     except Exception as exc:
         receipt = {'schema_version': 1, 'status': 'failed', 'submission_id': submission['submission_id'], 'region_id': submission['region_id'], 'failed_utc': utc_now(), 'error_type': type(exc).__name__, 'error': str(exc)[:4000]}
-        _archive(container, submission, 'failed', receipt)
+        # Preserve the pending AOI and metadata so an Airflow retry or a later
+        # scheduled run can resume.  The failure receipt is diagnostic history,
+        # not a destructive dead-letter move.
+        failed_base = FAILED_PREFIX + submission['submission_id'] + '/'
+        _upload_json(container, failed_base + f'receipt-{datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")}.json', receipt)
         container.get_blob_client(marker).delete_blob()
         raise
