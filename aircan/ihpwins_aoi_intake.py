@@ -89,21 +89,21 @@ def discover_resources(dataset_id: str = INTAKE_DATASET_ID, *, api_key: str | No
     # IHP-WINS can briefly return a stale package_show snapshot after its custom
     # upload workflow completes. The newest package activity contains the
     # committed resource list, so use that as a read-only fallback.
-    if not resource_items and int(package.get("num_resources") or 0) == 0:
-        activities = ckan_action("package_activity_list", {"id": dataset_id, "limit": 100}, api_key)
-        by_resource_id: dict[str, dict[str, Any]] = {}
-        for activity in activities:
-            activity_package = (activity.get("data") or {}).get("package") or {}
-            activity_resources = activity_package.get("resources") or []
-            for item in activity_resources:
-                resource_id = str(item.get("id") or "")
-                # Activities are newest first. Keep the newest representation
-                # of each resource, but merge IDs across snapshots because the
-                # IHP-WINS custom upload workflow can expose only the newest
-                # resource in any single snapshot.
-                if resource_id and resource_id not in by_resource_id:
-                    by_resource_id[resource_id] = item
-        resource_items = list(by_resource_id.values())
+    activities = ckan_action("package_activity_list", {"id": dataset_id, "limit": 100}, api_key)
+    by_resource_id: dict[str, dict[str, Any]] = {
+        str(item.get("id")): item for item in resource_items if item.get("id")
+    }
+    for activity in activities:
+        activity_package = (activity.get("data") or {}).get("package") or {}
+        activity_resources = activity_package.get("resources") or []
+        for item in activity_resources:
+            resource_id = str(item.get("id") or "")
+            # Activities are newest first. Keep the current package version
+            # when present, otherwise the newest historical representation.
+            # Authenticated package_show can expose only the latest upload.
+            if resource_id and resource_id not in by_resource_id:
+                by_resource_id[resource_id] = item
+    resource_items = list(by_resource_id.values())
     resources = []
     for item in resource_items:
         resource_format = str(item.get("format") or "").strip().lower()
@@ -314,9 +314,10 @@ def enqueue_preview(
     submission: dict[str, Any],
     *,
     connection_string_env: str = "AZURE_STORAGE_CONNECTION_STRING",
+    connection_string: str | None = None,
 ) -> dict[str, str]:
     """Atomically expose a validated AOI to provisioning (submission is last)."""
-    connection = os.getenv(connection_string_env, "").strip()
+    connection = (connection_string or os.getenv(connection_string_env, "")).strip()
     if not connection:
         raise RuntimeError(f"{connection_string_env} is not set")
     container = ContainerClient.from_connection_string(connection, AZURE_CONTAINER)
@@ -351,9 +352,10 @@ def enqueue_preview(
 
 def load_intake_registry(
     *, connection_string_env: str = "AZURE_STORAGE_CONNECTION_STRING",
+    connection_string: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Return stable source-resource assignments recorded after provisioning."""
-    connection = os.getenv(connection_string_env, "").strip()
+    connection = (connection_string or os.getenv(connection_string_env, "")).strip()
     if not connection:
         return {}
     container = ContainerClient.from_connection_string(connection, AZURE_CONTAINER)
@@ -378,6 +380,7 @@ def load_intake_registry(
                 "source_dataset_id": source.get("dataset_id"),
                 "source_resource_id": source_id,
                 "source_sha256": source.get("sha256"),
+                "source_last_modified": source.get("last_modified"),
                 "display_name": submission.get("display_name"),
                 "region_id": submission.get("region_id"),
                 "destination_dataset_name": submission.get("destination_dataset_name"),
@@ -396,6 +399,7 @@ def load_intake_registry(
                 "source_dataset_id": source.get("dataset_id"),
                 "source_resource_id": source_id,
                 "source_sha256": source.get("sha256"),
+                "source_last_modified": source.get("last_modified"),
                 "display_name": submission.get("display_name"),
                 "region_id": submission.get("region_id"),
                 "destination_dataset_name": submission.get("destination_dataset_name"),
@@ -408,9 +412,13 @@ def enqueue_live_dataset(
     *, dataset_id: str = INTAKE_DATASET_ID,
     output_root: Path = Path("output/intake_preview"),
     ckan_api_key: str | None = None,
+    azure_connection_string: str | None = None,
 ) -> dict[str, Any]:
     """Poll IHP-WINS once and enqueue only new or revised source resources."""
-    registry = load_intake_registry()
+    connection = (azure_connection_string or os.getenv("AZURE_STORAGE_CONNECTION_STRING") or "").strip()
+    if not connection:
+        raise RuntimeError("AZURE_STORAGE_CONNECTION_STRING is required for AOI intake")
+    registry = load_intake_registry(connection_string=connection)
     key = (ckan_api_key or os.getenv("IHP_WINS_CKAN_API_KEY") or os.getenv("CKAN_API_KEY") or "").strip()
     if not key:
         raise RuntimeError("IHP_WINS_CKAN_API_KEY or CKAN_API_KEY is required for AOI intake")
@@ -422,9 +430,18 @@ def enqueue_live_dataset(
     queued: list[dict[str, Any]] = []
     skipped: list[dict[str, str]] = []
     for resource in discover_resources(dataset_id, api_key=key):
-        data = download_resource(resource, api_key=key)
-        source_hash = hashlib.sha256(data).hexdigest()
         prior = registry.get(resource.id)
+        if prior and resource.last_modified and prior.get("source_last_modified") == resource.last_modified:
+            skipped.append({"resource_id": resource.id, "reason": "unchanged_last_modified"})
+            continue
+        try:
+            data = download_resource(resource, api_key=key)
+        except urllib.error.HTTPError as exc:
+            if exc.code in {404, 410}:
+                skipped.append({"resource_id": resource.id, "reason": f"source_unavailable_http_{exc.code}"})
+                continue
+            raise
+        source_hash = hashlib.sha256(data).hexdigest()
         if prior and (prior.get("source_sha256") == source_hash or prior.get("status") == "pending"):
             skipped.append({"resource_id": resource.id, "reason": "unchanged" if prior.get("source_sha256") == source_hash else "revision_waiting_for_pending_run"})
             continue
@@ -437,7 +454,7 @@ def enqueue_live_dataset(
             assigned_identity=prior,
         )
         write_preview(preview, geojson, submission, output_root)
-        enqueue_preview(preview, geojson, submission)
+        enqueue_preview(preview, geojson, submission, connection_string=connection)
         queued.append(asdict(preview))
         taken_region_ids.add(preview.region_id)
         taken_dataset_names.add(preview.destination_dataset_name)
