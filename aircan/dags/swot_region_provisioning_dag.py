@@ -34,7 +34,7 @@ def swot_region_provisioning():
     @task
     def intake() -> dict:
         from ihpwins_aoi_intake import enqueue_live_dataset
-        return enqueue_live_dataset()
+        return enqueue_live_dataset(ckan_api_key=ckan_api_key())
 
     @task
     def discover(_intake_result: dict) -> list[dict[str, str]]:
