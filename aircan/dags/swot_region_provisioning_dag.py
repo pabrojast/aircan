@@ -32,7 +32,12 @@ def ckan_api_key() -> str:
      tags=["swot", "provisioning", "aoi", "azure", "ckan", "unesco"])
 def swot_region_provisioning():
     @task
-    def discover() -> list[dict[str, str]]:
+    def intake() -> dict:
+        from ihpwins_aoi_intake import enqueue_live_dataset
+        return enqueue_live_dataset()
+
+    @task
+    def discover(_intake_result: dict) -> list[dict[str, str]]:
         from swot_region_provisioning import discover_submissions
         # The pending inbox is already an explicit work queue. Do not silently
         # suppress valid submissions through a stale deployment filter.
@@ -48,7 +53,7 @@ def swot_region_provisioning():
             retries=int(setting("SWOT_PROVISION_REQUEST_RETRIES", "5")),
             ckan_api_key=ckan_api_key())
 
-    provision.expand(descriptor=discover())
+    provision.expand(descriptor=discover(intake()))
 
 
 dag = swot_region_provisioning()
