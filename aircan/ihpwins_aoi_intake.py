@@ -69,6 +69,7 @@ def ckan_action(action: str, payload: dict[str, Any], api_key: str | None = None
     api_key = (api_key or os.getenv("IHP_WINS_CKAN_API_KEY") or os.getenv("CKAN_API_KEY") or "").strip()
     if api_key:
         headers["Authorization"] = api_key
+        headers["X-CKAN-API-Key"] = api_key
     request = urllib.request.Request(
         f"{CKAN_BASE}/api/3/action/{action}",
         data=json.dumps(payload).encode("utf-8"),
@@ -143,6 +144,7 @@ def download_resource(resource: IntakeResource, *, api_key: str | None = None) -
         # Send the CKAN token to IHP-WINS, but do not copy it onto the Azure
         # download request created by CKAN's redirect.
         request.add_unredirected_header("Authorization", api_key)
+        request.add_unredirected_header("X-CKAN-API-Key", api_key)
     try:
         with urllib.request.urlopen(request, timeout=120) as response:
             data = response.read()
