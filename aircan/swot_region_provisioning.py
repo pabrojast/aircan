@@ -250,6 +250,47 @@ def atomic_csv(frame: pd.DataFrame, destination: Path) -> None:
     frame.to_csv(temporary, index=False, lineterminator='\n')
     temporary.replace(destination)
 
+def merge_cached_dawg_rows(
+    rows_by_reach: dict[str, pd.DataFrame],
+    reach_results: list[FeatureResult],
+    timeseries_directory: Path,
+) -> dict[str, int]:
+    """Outer-merge validated Azure DAWG rows into full historical CSVs."""
+    by_id = {item.feature_id: item for item in reach_results}
+    merged_reaches = 0
+    discharge_observations = 0
+    for reach_id, discharge in rows_by_reach.items():
+        if discharge is None or discharge.empty:
+            continue
+        csv_path = timeseries_directory / f'reach_{reach_id}.csv'
+        if csv_path.exists():
+            existing = pd.read_csv(csv_path, dtype={'reach_id': 'string'})
+        else:
+            existing = pd.DataFrame(columns=REACH_OUTPUT_COLUMNS)
+        if 'reach_id' not in existing:
+            existing['reach_id'] = reach_id
+        incoming = discharge[['time_utc', 'consensus_q']].copy()
+        incoming['reach_id'] = reach_id
+        incoming['consensus_q_units'] = 'm^3/s'
+        existing = existing.drop(columns=['consensus_q', 'consensus_q_units'], errors='ignore')
+        merged = existing.merge(incoming, on=['reach_id', 'time_utc'], how='outer')
+        for column in REACH_OUTPUT_COLUMNS:
+            if column not in merged:
+                merged[column] = pd.NA
+        merged = (merged[REACH_OUTPUT_COLUMNS]
+                  .drop_duplicates(['reach_id', 'time_utc', 'cycle_id', 'pass_id'], keep='last')
+                  .sort_values('time_utc').reset_index(drop=True))
+        atomic_csv(merged, csv_path)
+        merged_reaches += 1
+        discharge_observations += int(merged['consensus_q'].notna().sum())
+        item = by_id.get(reach_id)
+        if item:
+            item.accepted_rows = len(merged)
+            item.output_csv = str(csv_path)
+            item.status = 'ok_dawg'
+    return {'reaches_with_discharge': merged_reaches,
+            'discharge_observations': discharge_observations}
+
 def download_feature(product: str, feature_id: str, destination: Path, start: str, end: str, timeout: int, retries: int, overwrite_local: bool) -> FeatureResult:
     if destination.exists() and (not overwrite_local):
         try:
@@ -405,6 +446,29 @@ def run_historical_aoi_pipeline(*, aoi: str, region_id: str, display_name: str, 
             item.output_csv = str(csv_path)
             if item.status not in {'ok', 'skipped_existing'}:
                 item.status = 'ok_dawg'
+    elif upload:
+        # Provisioning consumes the same immutable, validated Azure DAWG
+        # pointer as the daily reach updater. It never contacts Earthdata.
+        from reach_dawg_cache import refresh_rows
+        connection_string = runtime_secret(connection_string_env)
+        if not connection_string:
+            raise ValueError(f'Airflow Variable or environment variable {connection_string_env!r} is empty')
+        dawg_container = ContainerClient.from_connection_string(connection_string, AZURE_CONTAINER)
+        pointer = _load_existing_manifest(dawg_container, 'reference/dawg/current.json')
+        dawg_rows, dawg_revisions, missing_dawg = refresh_rows(
+            dawg_container, pointer, {}, reach_ids,
+        )
+        merged = merge_cached_dawg_rows(
+            dawg_rows, reach_results, root / 'reaches' / 'timeseries',
+        )
+        dawg_summary = {
+            'source': 'reference/dawg/current.json',
+            'status': 'available' if not missing_dawg else 'missing_continental_reference',
+            'revisions': dawg_revisions,
+            'missing_continents': missing_dawg,
+            'matched_reaches': len(dawg_rows),
+            **merged,
+        }
     result_rows = reach_results + node_results
     logs_dir = root / 'logs'
     logs_dir.mkdir(parents=True, exist_ok=True)
