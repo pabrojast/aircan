@@ -64,9 +64,9 @@ class IntakePreview:
     geometry_types: list[str]
 
 
-def ckan_action(action: str, payload: dict[str, Any]) -> dict[str, Any]:
+def ckan_action(action: str, payload: dict[str, Any], api_key: str | None = None) -> dict[str, Any]:
     headers = {"Content-Type": "application/json"}
-    api_key = os.getenv("CKAN_API_KEY")
+    api_key = (api_key or os.getenv("IHP_WINS_CKAN_API_KEY") or os.getenv("CKAN_API_KEY") or "").strip()
     if api_key:
         headers["Authorization"] = api_key
     request = urllib.request.Request(
@@ -82,14 +82,14 @@ def ckan_action(action: str, payload: dict[str, Any]) -> dict[str, Any]:
     return result["result"]
 
 
-def discover_resources(dataset_id: str = INTAKE_DATASET_ID) -> list[IntakeResource]:
-    package = ckan_action("package_show", {"id": dataset_id})
+def discover_resources(dataset_id: str = INTAKE_DATASET_ID, *, api_key: str | None = None) -> list[IntakeResource]:
+    package = ckan_action("package_show", {"id": dataset_id}, api_key)
     resource_items = package.get("resources") or []
     # IHP-WINS can briefly return a stale package_show snapshot after its custom
     # upload workflow completes. The newest package activity contains the
     # committed resource list, so use that as a read-only fallback.
     if not resource_items and int(package.get("num_resources") or 0) == 0:
-        activities = ckan_action("package_activity_list", {"id": dataset_id, "limit": 100})
+        activities = ckan_action("package_activity_list", {"id": dataset_id, "limit": 100}, api_key)
         by_resource_id: dict[str, dict[str, Any]] = {}
         for activity in activities:
             activity_package = (activity.get("data") or {}).get("package") or {}
@@ -123,20 +123,21 @@ def discover_resources(dataset_id: str = INTAKE_DATASET_ID) -> list[IntakeResour
     return sorted(resources, key=lambda item: (item.name.casefold(), item.id))
 
 
-def existing_destination_dataset_names() -> set[str]:
+def existing_destination_dataset_names(*, api_key: str | None = None) -> set[str]:
     result = ckan_action(
         "package_search",
         {"q": "name:swot-sword-surface-water-observations-*", "rows": 1000},
+        api_key,
     )
     return {str(item.get("name") or "").casefold() for item in result.get("results", [])}
 
 
-def download_resource(resource: IntakeResource) -> bytes:
+def download_resource(resource: IntakeResource, *, api_key: str | None = None) -> bytes:
     if not resource.url:
         raise ValueError(f"Resource {resource.id} has no download URL")
     resource_url = urllib.parse.urljoin(CKAN_BASE, resource.url)
     headers = {"User-Agent": "UNESCO-SWOT-AOI-Intake/1.0"}
-    api_key = os.getenv("CKAN_API_KEY")
+    api_key = (api_key or os.getenv("IHP_WINS_CKAN_API_KEY") or os.getenv("CKAN_API_KEY") or "").strip()
     request = urllib.request.Request(resource_url, headers=headers)
     if api_key:
         # Send the CKAN token to IHP-WINS, but do not copy it onto the Azure
@@ -404,18 +405,22 @@ def load_intake_registry(
 def enqueue_live_dataset(
     *, dataset_id: str = INTAKE_DATASET_ID,
     output_root: Path = Path("output/intake_preview"),
+    ckan_api_key: str | None = None,
 ) -> dict[str, Any]:
     """Poll IHP-WINS once and enqueue only new or revised source resources."""
     registry = load_intake_registry()
-    taken_dataset_names = existing_destination_dataset_names()
+    key = (ckan_api_key or os.getenv("IHP_WINS_CKAN_API_KEY") or os.getenv("CKAN_API_KEY") or "").strip()
+    if not key:
+        raise RuntimeError("IHP_WINS_CKAN_API_KEY or CKAN_API_KEY is required for AOI intake")
+    taken_dataset_names = existing_destination_dataset_names(api_key=key)
     prefix = "swot-sword-surface-water-observations-"
     taken_region_ids = {
         name[len(prefix):] for name in taken_dataset_names if name.startswith(prefix)
     }
     queued: list[dict[str, Any]] = []
     skipped: list[dict[str, str]] = []
-    for resource in discover_resources(dataset_id):
-        data = download_resource(resource)
+    for resource in discover_resources(dataset_id, api_key=key):
+        data = download_resource(resource, api_key=key)
         source_hash = hashlib.sha256(data).hexdigest()
         prior = registry.get(resource.id)
         if prior and (prior.get("source_sha256") == source_hash or prior.get("status") == "pending"):
