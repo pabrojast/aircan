@@ -804,6 +804,7 @@ def ensure_destination_dataset(session: requests.Session, submission: dict[str, 
     else:
         return api(session, 'package_patch', {
             'id': existing['id'],
+            'private': 'false',
             'title': requested_title,
             'title_translated': json.dumps({'en': requested_title, 'es': '', 'fr': ''}),
             'notes': description,
@@ -828,6 +829,7 @@ def ensure_destination_dataset(session: requests.Session, submission: dict[str, 
         'language': 'http://publications.europa.eu/resource/authority/language/ENG',
         'topic': 'http://inspire.ec.europa.eu/metadata-codelist/TopicCategory/inlandWaters',
         'access_level': 'public',
+        'private': 'false',
     }
     return api(session, 'package_create', data)
 
@@ -932,9 +934,12 @@ def publish_region(root: Path, display_name: str | None=None, region_id: str | N
     for kind in ('reaches', 'nodes'):
         name = f'{display_name} SWOT-SWORD {kind.title()} (Version D)'
         description = f'SWORD v17b river {kind} in {display_name} linked to SWOT RiverSP Version D time series.'
-        azure_url = f'https://{AZURE_ACCOUNT}.blob.core.windows.net/{AZURE_CONTAINER}/{geometry_blobs[kind]}'
-        resource = publish_url_resource(session, dataset, name, description, azure_url, previous_ckan.get(id_keys[kind]))
-        config = terria_config(region_id, display_name, kind, azure_url, prepared[kind][1])
+        # Use the proven CKAN-uploaded GeoJSON resource for the dataset and
+        # viewer. Feature-level CSV links inside it still point to Azure.
+        resource = publish_resource(session, dataset, name, description,
+                                    prepared[kind][0], previous_ckan.get(id_keys[kind]))
+        config = terria_config(region_id, display_name, kind,
+                               resource['url'], prepared[kind][1])
         viewer = TERRIA + quote_plus(json.dumps(config, ensure_ascii=False, separators=(',', ':')))
         view = publish_view(session, resource['id'], f'{display_name} SWOT-SWORD {kind.title()} Explorer', description, viewer)
         (out / f'{kind}-terria.json').write_text(json.dumps(config, indent=2), encoding='utf-8')
@@ -950,7 +955,7 @@ def publish_region(root: Path, display_name: str | None=None, region_id: str | N
     improve_dataset_metadata(session, dataset, root, prepared['reaches'][1])
     manifest['status'] = 'published'
     for kind in ('reaches', 'nodes'):
-        manifest['products'][kind]['publication_mode'] = 'azure_url'
+        manifest['products'][kind]['publication_mode'] = 'ckan_upload'
         manifest['products'][kind]['enabled'] = True
     manifest['ckan'] = {'dataset_id': dataset, 'reach_resource_id': results['reaches']['resource_id'], 'node_resource_id': results['nodes']['resource_id']}
     if 'documentation' in results:
