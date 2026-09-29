@@ -32,12 +32,15 @@ from swot_nodes_update import (
     utc_now, utc_text,
 )
 
-REACH_FIELDS = "time_str,wse,slope,width,reach_q"
+REACH_FILTER_FIELDS = ("reach_q", "obs_frac_n", "dark_frac", "xovr_cal_q", "ice_clim_f", "xtrk_dist")
+REACH_FIELDS = "time_str,wse,slope,width,reach_q,obs_frac_n,dark_frac,xovr_cal_q,ice_clim_f,xtrk_dist"
 REACH_OUTPUT_COLUMNS = [
     "time_utc", "wse", "slope", "width", "reach_q",
     "wse_units", "slope_units", "width_units", "consensus_q",
+    "obs_frac_n", "dark_frac", "xovr_cal_q", "ice_clim_f", "xtrk_dist",
 ]
 FILL_VALUE_THRESHOLD = -1.0e9
+HISTORICAL_START_UTC = "2023-03-30T00:00:00Z"
 
 
 @dataclass
@@ -47,6 +50,7 @@ class ReachResult:
     query_start_utc: str
     query_end_utc: str
     input_rows: int = 0
+    rejected_rows: int = 0
     previous_rows: int = 0
     final_rows: int = 0
     first_observation_utc: str = ""
@@ -98,6 +102,27 @@ def read_reach_csv(data: bytes | None) -> pd.DataFrame:
         return pd.DataFrame(columns=REACH_OUTPUT_COLUMNS)
 
 
+def filter_reach_observations(frame: pd.DataFrame) -> pd.DataFrame:
+    """Keep only RiverSP reaches passing every required quality check."""
+    if frame.empty:
+        return frame.copy()
+    missing = [field for field in REACH_FILTER_FIELDS if field not in frame]
+    if missing:
+        raise ValueError(f"Hydrocron reach response is missing required quality fields: {missing}")
+    q = {field: pd.to_numeric(frame[field], errors="coerce") for field in REACH_FILTER_FIELDS}
+    swath = q["xtrk_dist"].abs()
+    nonfill = pd.Series(True, index=frame.index)
+    for values in q.values():
+        nonfill &= values.notna() & values.abs().lt(1.0e9)
+    valid = (nonfill & q["reach_q"].between(0, 2)
+             & q["obs_frac_n"].ge(0.5)
+             & q["dark_frac"].le(0.3)
+             & q["xovr_cal_q"].eq(0)
+             & q["ice_clim_f"].eq(0)
+             & swath.gt(10_000) & swath.lt(60_000))
+    return frame.loc[valid].copy()
+
+
 def normalize_reaches(frame: pd.DataFrame) -> pd.DataFrame:
     """Enforce the exact nine-column contract used by the proven updater."""
     if frame is None or frame.empty:
@@ -110,7 +135,7 @@ def normalize_reaches(frame: pd.DataFrame) -> pd.DataFrame:
     parsed = pd.to_datetime(output["time_utc"], format="mixed", errors="coerce", utc=True)
     output = output.loc[parsed.notna()].copy()
     output["time_utc"] = parsed.loc[output.index].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    for column in ("wse", "slope", "width", "reach_q", "consensus_q"):
+    for column in ("wse", "slope", "width", "reach_q", "consensus_q", *REACH_FILTER_FIELDS[1:]):
         if column in output:
             output[column] = pd.to_numeric(output[column], errors="coerce")
             output.loc[output[column] <= FILL_VALUE_THRESHOLD, column] = pd.NA
@@ -188,6 +213,7 @@ def update_one_reach(
     overlap_hours: int, backfill_days_if_empty: int, timeout: int, retries: int,
     query_start_utc: str | None = None,
     discharge: pd.DataFrame | None = None,
+    full_refresh: bool = False,
 ) -> ReachResult:
     reach_id = clean_id(properties.get("reach_id", ""))
     start_text = query_start_utc or ""
@@ -205,6 +231,8 @@ def update_one_reach(
         # per-CSV boundary when the source has not yet delivered newer data.
         if latest:
             start = min(start, parse_utc(latest) - timedelta(hours=overlap_hours))
+        if full_refresh:
+            start = parse_utc(HISTORICAL_START_UTC)
         if start >= end:
             raise ValueError("Query start must precede query end")
         start_text = utc_text(start)
@@ -229,13 +257,16 @@ def update_one_reach(
                 if not isinstance(payload.get('results'), dict) or 'csv' not in payload['results']:
                     raise ValueError('Hydrocron success response is missing results.csv')
             raw = response_frame(response.text)
-            if not raw.empty and not {'time_str', 'wse', 'slope', 'width', 'reach_q'}.issubset(raw.columns):
+            if not raw.empty and not {'time_str', 'wse', 'slope', 'width', *REACH_FILTER_FIELDS}.issubset(raw.columns):
                 raise ValueError('Hydrocron CSV is missing requested columns')
             if not raw.empty:
                 raw = raw.loc[
                     raw['time_str'].astype(str).str.strip().str.lower().ne('no_data')
                 ].copy()
-        incoming = normalize_reaches(raw)
+        accepted_raw = filter_reach_observations(raw)
+        incoming = normalize_reaches(accepted_raw)
+        if full_refresh and raw.empty and existing[['wse', 'slope', 'width', 'reach_q']].notna().any(axis=1).any():
+            raise RuntimeError('Full reach refresh returned no source observations for a CSV containing RiverSP observations')
         if not raw.empty and pd.to_datetime(raw['time_str'], format='mixed', errors='coerce', utc=True).notna().sum() == 0:
             raise ValueError('Hydrocron returned no parseable observation dates')
         existing_times = set(existing["time_utc"].astype(str))
@@ -244,7 +275,13 @@ def update_one_reach(
         # Merge the complete overlap, as the working updater does. Hydrocron
         # may revise an already-known timestamp; novelty alone is not enough
         # to decide whether the CSV changed.
-        final = merge_reaches(existing, incoming)
+        if full_refresh:
+            # Rebuild the RiverSP portion, retaining only prior DAWG discharge.
+            # Existing unfiltered RiverSP rows must not survive the rebuild.
+            prior_discharge = existing[['time_utc', 'consensus_q']].dropna(subset=['consensus_q'])
+            final = merge_discharge(incoming, prior_discharge)
+        else:
+            final = merge_reaches(existing, incoming)
         if discharge is not None:
             discharge = discharge.loc[pd.to_datetime(discharge.time_utc, utc=True) <= end]
         final = merge_discharge(final, discharge)
@@ -267,7 +304,7 @@ def update_one_reach(
         first, last = observation_bounds(final)
         return ReachResult(
             reach_id, "success_with_data" if changed else ("success_no_data" if len(final) or response.status_code != 400 else "not_found"),
-            start_text, query_end_utc, input_rows=len(raw), previous_rows=len(existing),
+            start_text, query_end_utc, input_rows=len(raw), rejected_rows=len(raw) - len(accepted_raw), previous_rows=len(existing),
             final_rows=len(final), first_observation_utc=first,
             latest_observation_utc=last, blob_changed=changed,
             message=(response.text[:400] if response.status_code == 400 else f"novel_timestamps={novel_count}"),
@@ -287,7 +324,8 @@ def update_reach_region(
     overlap_hours: int = 0, backfill_days_if_empty: int = 2,
     batch_size: int = 500, request_workers: int = 4,
     timeout: int = 60, retries: int = 5, run_end_utc: str | None = None,
-    ckan_timeout: int = 900, ckan_api_key: str | None = None, **_ignored: Any,
+    ckan_timeout: int = 900, ckan_api_key: str | None = None,
+    full_refresh: bool = False, **_ignored: Any,
 ) -> dict[str, Any]:
     container = get_container(connection_string_env)
     region_id = safe_region(region["region_id"])
@@ -390,6 +428,7 @@ def update_reach_region(
                 query_start_utc=retry_starts.get(clean_id(props.get('reach_id', ''))) or successful_end,
                 discharge=dawg_rows.get(clean_id(props.get('reach_id', ''))),
                 backfill_days_if_empty=backfill_days_if_empty,
+                full_refresh=full_refresh,
                 timeout=timeout, retries=retries,
             ) for props, blob in records[offset:offset + batch_size]]
             results.extend(future.result() for future in as_completed(futures))
@@ -472,9 +511,11 @@ def update_reach_region(
     )
     counts = Counter(item.status for item in results)
     summary = {
-        "schema_version": 4, "region_id": region_id, "run_id": run_id,
+            "schema_version": 5, "region_id": region_id, "run_id": run_id,
         "previous_successful_end_utc": successful_end,
-        "query_policy": "earlier_of_successful_run_and_stored_hydrocron_no_overlap",
+        "query_policy": ("explicit_full_reach_refresh" if full_refresh else
+                         "earlier_of_successful_run_and_stored_hydrocron_no_overlap"),
+        "full_refresh": full_refresh,
         "run_end_utc": end_text, "reach_count": len(records),
         "batch_size": batch_size,
         "batch_count": (len(records) + batch_size - 1) // batch_size,
@@ -487,6 +528,7 @@ def update_reach_region(
         "geometry_updated": geometry_changed, "ckan_updated": ckan_updated,
         "changed_chart_csvs": sum(item.chart_changed for item in results),
         "source_rows_received": sum(item.input_rows for item in results),
+        "source_rows_rejected_by_quality": sum(item.rejected_rows for item in results),
         "latest_source_observation_utc": max((item.source_latest_utc for item in results), default='') or None,
         "latest_stored_hydrocron_observation_utc": max((item.stored_hydrocron_latest_utc for item in results), default='') or None,
         "query_start_min_utc": min((item.query_start_utc for item in results if item.query_start_utc), default=None),
@@ -502,7 +544,7 @@ def update_reach_region(
                                    if not summary['changed_csvs'] else None)
     upload_json(container, f"regions/{region_id}/logs/reach_update_latest.json", summary)
     upload_json(container, f"regions/{region_id}/state/reach_update.json", {
-        "schema_version": 4, "region_id": region_id, "last_run_id": run_id,
+        "schema_version": 5, "region_id": region_id, "last_run_id": run_id,
         "last_successful_end_utc": end_text if not counts.get('retryable_failure', 0) else successful_end,
         "updated_utc": utc_text(utc_now()), "per_reach_csv_watermarks": False,
         "query_policy": "earlier_of_successful_run_and_stored_hydrocron_no_overlap",
