@@ -146,12 +146,11 @@ COLLECTION = 'SWOT_L2_HR_RiverSP_D'
 
 DEFAULT_START = '2023-03-30T00:00:00Z'
 
-REACH_FILTER_FIELDS = ('reach_q', 'obs_frac_n', 'dark_frac', 'xovr_cal_q', 'ice_clim_f', 'xtrk_dist')
-REACH_FIELDS = 'reach_id,time_str,cycle_id,pass_id,wse,slope,width,area_total,dschg_gm,dschg_gm_q,reach_q,reach_q_b,obs_frac_n,dark_frac,xovr_cal_q,ice_clim_f,xtrk_dist,river_name,crid,sword_version,collection_shortname,collection_version,granuleUR'
+REACH_FIELDS = 'reach_id,time_str,cycle_id,pass_id,wse,slope,width,area_total,dschg_gm,dschg_gm_q,reach_q,reach_q_b,river_name,crid,sword_version,collection_shortname,collection_version,granuleUR'
 
 NODE_FIELDS = 'node_id,reach_id,time_str,lat,lon,river_name,wse,wse_u,wse_r_u,width,width_u,node_q,node_q_b,ice_clim_f,xovr_cal_q,cycle_id,pass_id,crid,sword_version,collection_shortname,collection_version,granuleUR'
 
-REACH_OUTPUT_COLUMNS = ['reach_id', 'time_utc', 'wse', 'wse_units', 'slope', 'slope_units', 'width', 'width_units', 'area_total', 'area_total_units', 'dschg_gm', 'dschg_gm_units', 'dschg_gm_q', 'reach_q', 'reach_q_b', 'obs_frac_n', 'dark_frac', 'xovr_cal_q', 'ice_clim_f', 'xtrk_dist', 'consensus_q', 'consensus_q_units', 'cycle_id', 'pass_id', 'river_name', 'crid', 'sword_version', 'collection_shortname', 'collection_version', 'granuleUR']
+REACH_OUTPUT_COLUMNS = ['reach_id', 'time_utc', 'wse', 'wse_units', 'slope', 'slope_units', 'width', 'width_units', 'area_total', 'area_total_units', 'dschg_gm', 'dschg_gm_units', 'dschg_gm_q', 'reach_q', 'reach_q_b', 'consensus_q', 'consensus_q_units', 'cycle_id', 'pass_id', 'river_name', 'crid', 'sword_version', 'collection_shortname', 'collection_version', 'granuleUR']
 
 _thread_local = threading.local()
 
@@ -204,26 +203,6 @@ def response_frame(text: str) -> pd.DataFrame:
     except EmptyDataError:
         return pd.DataFrame()
 
-def filter_reach_observations(frame: pd.DataFrame) -> pd.DataFrame:
-    """Keep only RiverSP reaches passing every required quality check."""
-    if frame.empty:
-        return frame.copy()
-    missing = [field for field in REACH_FILTER_FIELDS if field not in frame]
-    if missing:
-        raise ValueError(f"Hydrocron reach response is missing required quality fields: {missing}")
-    q = {field: pd.to_numeric(frame[field], errors='coerce') for field in REACH_FILTER_FIELDS}
-    swath = q['xtrk_dist'].abs()
-    nonfill = pd.Series(True, index=frame.index)
-    for values in q.values():
-        nonfill &= values.notna() & values.abs().lt(1.0e9)
-    valid = (nonfill & q['reach_q'].between(0, 2)
-             & q['obs_frac_n'].ge(0.5)
-             & q['dark_frac'].le(0.3)
-             & q['xovr_cal_q'].eq(0)
-             & q['ice_clim_f'].eq(0)
-             & swath.gt(10_000) & swath.lt(60_000))
-    return frame.loc[valid].copy()
-
 def hydrocron_get(params: dict[str, str], timeout: int, retries: int) -> requests.Response:
     last_error: Exception | None = None
     for attempt in range(retries):
@@ -244,7 +223,6 @@ def normalize_reaches(frame: pd.DataFrame) -> pd.DataFrame:
     if 'time_str' not in frame:
         raise ValueError('Hydrocron reach response has no time_str field')
     output = frame.copy()
-    output = filter_reach_observations(output)
     parsed = pd.to_datetime(output['time_str'], format='mixed', errors='coerce', utc=True)
     output = output.loc[parsed.notna()].copy()
     output['time_utc'] = parsed.loc[output.index].dt.strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -261,8 +239,7 @@ def normalize_reaches(frame: pd.DataFrame) -> pd.DataFrame:
     # sentinels (commonly -999999999999). They must be blanked before storage;
     # otherwise Terria charts them as enormous real values.
     for column in ('wse', 'slope', 'width', 'area_total', 'dschg_gm',
-                   'dschg_gm_q', 'reach_q', 'reach_q_b', 'obs_frac_n',
-                   'dark_frac', 'xovr_cal_q', 'ice_clim_f', 'xtrk_dist', 'consensus_q'):
+                   'dschg_gm_q', 'reach_q', 'reach_q_b', 'consensus_q'):
         values = pd.to_numeric(output[column], errors='coerce')
         output[column] = values.mask(values.abs().ge(FILL_ABS_THRESHOLD))
     return output[REACH_OUTPUT_COLUMNS].drop_duplicates(['reach_id', 'time_utc', 'cycle_id', 'pass_id'], keep='last').sort_values('time_utc').reset_index(drop=True)
@@ -509,11 +486,6 @@ def run_historical_aoi_pipeline(*, aoi: str, region_id: str, display_name: str, 
         sample = ', '.join(f'{item.product}:{item.feature_id}:{item.status}' for item in unresolved[:10])
         raise RuntimeError(f'{len(unresolved)} transient Hydrocron requests remain unresolved: {sample}')
     summary: dict[str, Any] = {'schema_version': 2, 'region_id': region_id, 'display_name': display_name, 'run_started_utc': run_started, 'run_finished_utc': utc_now(), 'window': {'start': start, 'end': end}, 'hydrocron_collection': COLLECTION, 'sword_version': 'v17b', 'reference_scope': 'global_partitioned', 'reference_partition_counts': {'reaches': reach_partition_counts, 'nodes': node_partition_counts}, 'reaches': {'selected': len(reaches), 'with_data': int(reach_layer.has_data.sum()), 'observations': sum((item.accepted_rows for item in reach_results)), 'statuses': dict(Counter((item.status for item in reach_results)))}, 'nodes': {'selected': len(nodes), 'with_data': int(node_layer.has_data.sum()), 'observations': sum((item.accepted_rows for item in node_results)), 'statuses': dict(Counter((item.status for item in node_results)))}, 'dawg': dawg_summary, 'node_quality_filter': {'ice_clim_f': '== 0', 'node_q': '< 3', 'xovr_cal_q': '< 2', 'wse': 'finite non-fill', 'node_q_b_bits_unset_zero_based': [13, 14, 19, 23]}, 'azure': {'account': AZURE_ACCOUNT, 'container': AZURE_CONTAINER, 'prefix': f'regions/{region_id}/', 'uploaded': False}}
-    summary['reach_quality_filter'] = {
-        'reach_q': '0 to 2', 'obs_frac_n': '>= 0.5', 'dark_frac': '<= 0.3',
-        'xovr_cal_q': '== 0', 'ice_clim_f': '== 0',
-        'abs_xtrk_dist_m': '> 10000 and < 60000',
-    }
     summary_path = root / 'run_summary.json'
     summary_path.write_text(json.dumps(summary, indent=2), encoding='utf-8')
     manifest = {'schema_version': 1, 'region_id': region_id, 'display_name': display_name, 'status': 'historical_built', 'aoi_blob': f'regions/{region_id}/source/aoi.geojson', 'products': {'reaches': {'geometry_blob': f'regions/{region_id}/reaches/reaches.geojson', 'timeseries_prefix': f'regions/{region_id}/reaches/timeseries/', 'filename': 'reach_{reach_id}.csv'}, 'nodes': {'geometry_blob': f'regions/{region_id}/nodes/nodes.geojson', 'timeseries_prefix': f'regions/{region_id}/nodes/timeseries/', 'filename': 'node_{node_id}.csv'}}, 'historical_summary': summary}
@@ -590,8 +562,8 @@ def camera(value: dict[str, float]) -> dict[str, float]:
 
 def chart_html(kind: str) -> str:
     if kind == 'nodes':
-        return "<div><strong>SWOT River Node</strong><p>Teal nodes contain Version D observations passing the project quality filter; gray nodes currently have none.</p></div>{{#has_data}}<chart id='{{node_id}}-variables' title='Node Variables - {{node_id}}' src='{{url}}' downloads='{{url}}' x-column='time_utc' y-columns='wse,width' chart-type='lineAndPoint' stroke='rgba(0,0,0,0)' can-download='true'></chart>{{/has_data}}<table><tr><th>Node ID</th><td>{{node_id}}</td></tr><tr><th>Reach ID</th><td>{{reach_id}}</td></tr><tr><th>Accepted observations</th><td>{{observation_count}}</td></tr>{{#has_data}}<tr><th>Full CSV</th><td><a href='{{url}}' target='_blank'>Open CSV</a></td></tr>{{/has_data}}</table>"
-    return "<div><strong>SWOT River Reach</strong><p>Blue reaches contain valid DAWG consensus discharge; brown reaches retain SWOT observations without discharge.</p></div>{{#has_data}}<chart id='{{reach_id}}-variables' title='Reach Variables - {{reach_id}}' src='{{chart_url}}' downloads='{{url}}' x-column='time_utc' y-columns='wse,slope_cm_per_km,width,consensus_q' column-titles='slope_cm_per_km:Slope (cm/km)' chart-type='lineAndPoint' stroke='rgba(0,0,0,0)' can-download='true'></chart>{{/has_data}}<table><tr><th>Reach ID</th><td>{{reach_id}}</td></tr><tr><th>Observations</th><td>{{observation_count}}</td></tr><tr><th>Discharge observations</th><td>{{discharge_count}}</td></tr>{{#has_data}}<tr><th>Full CSV</th><td><a href='{{url}}' target='_blank'>Open CSV</a></td></tr>{{/has_data}}</table>"
+        return "<div><strong>SWOT River Node</strong><p>Teal nodes contain Version D observations passing the project quality filter; gray nodes currently have none.</p></div>{{#has_data}}<chart id='{{node_id}}-variables' title='Node Variables - {{node_id}}' src='{{url}}' x-column='time_utc' y-columns='wse,width' chart-type='lineAndPoint' stroke='rgba(0,0,0,0)' can-download='false'></chart>{{/has_data}}<table><tr><th>Node ID</th><td>{{node_id}}</td></tr><tr><th>Reach ID</th><td>{{reach_id}}</td></tr><tr><th>Accepted observations</th><td>{{observation_count}}</td></tr>{{#has_data}}<tr><th>Full CSV</th><td><a href='{{url}}' target='_blank'>Open CSV</a></td></tr>{{/has_data}}</table>"
+    return "<div><strong>SWOT River Reach</strong><p>Blue reaches contain valid DAWG consensus discharge; brown reaches retain SWOT observations without discharge.</p></div>{{#has_data}}<chart id='{{reach_id}}-variables' title='Reach Variables - {{reach_id}}' src='{{chart_url}}' x-column='time_utc' y-columns='wse,slope_cm_per_km,width,consensus_q' column-titles='slope_cm_per_km:Slope (cm/km)' chart-type='lineAndPoint' stroke='rgba(0,0,0,0)' can-download='false'></chart>{{/has_data}}<table><tr><th>Reach ID</th><td>{{reach_id}}</td></tr><tr><th>Observations</th><td>{{observation_count}}</td></tr><tr><th>Discharge observations</th><td>{{discharge_count}}</td></tr>{{#has_data}}<tr><th>Full CSV</th><td><a href='{{url}}' target='_blank'>Open CSV</a></td></tr>{{/has_data}}</table>"
 
 def terria_config(region_id: str, display_name: str, kind: str, url: str, layer_bounds: dict[str, float]) -> dict[str, Any]:
     singular = 'node' if kind == 'nodes' else 'reach'
@@ -804,7 +776,6 @@ def ensure_destination_dataset(session: requests.Session, submission: dict[str, 
     else:
         return api(session, 'package_patch', {
             'id': existing['id'],
-            'private': 'false',
             'title': requested_title,
             'title_translated': json.dumps({'en': requested_title, 'es': '', 'fr': ''}),
             'notes': description,
@@ -829,7 +800,6 @@ def ensure_destination_dataset(session: requests.Session, submission: dict[str, 
         'language': 'http://publications.europa.eu/resource/authority/language/ENG',
         'topic': 'http://inspire.ec.europa.eu/metadata-codelist/TopicCategory/inlandWaters',
         'access_level': 'public',
-        'private': 'false',
     }
     return api(session, 'package_create', data)
 
@@ -934,12 +904,9 @@ def publish_region(root: Path, display_name: str | None=None, region_id: str | N
     for kind in ('reaches', 'nodes'):
         name = f'{display_name} SWOT-SWORD {kind.title()} (Version D)'
         description = f'SWORD v17b river {kind} in {display_name} linked to SWOT RiverSP Version D time series.'
-        # Use the proven CKAN-uploaded GeoJSON resource for the dataset and
-        # viewer. Feature-level CSV links inside it still point to Azure.
-        resource = publish_resource(session, dataset, name, description,
-                                    prepared[kind][0], previous_ckan.get(id_keys[kind]))
-        config = terria_config(region_id, display_name, kind,
-                               resource['url'], prepared[kind][1])
+        azure_url = f'https://{AZURE_ACCOUNT}.blob.core.windows.net/{AZURE_CONTAINER}/{geometry_blobs[kind]}'
+        resource = publish_url_resource(session, dataset, name, description, azure_url, previous_ckan.get(id_keys[kind]))
+        config = terria_config(region_id, display_name, kind, azure_url, prepared[kind][1])
         viewer = TERRIA + quote_plus(json.dumps(config, ensure_ascii=False, separators=(',', ':')))
         view = publish_view(session, resource['id'], f'{display_name} SWOT-SWORD {kind.title()} Explorer', description, viewer)
         (out / f'{kind}-terria.json').write_text(json.dumps(config, indent=2), encoding='utf-8')
@@ -955,7 +922,7 @@ def publish_region(root: Path, display_name: str | None=None, region_id: str | N
     improve_dataset_metadata(session, dataset, root, prepared['reaches'][1])
     manifest['status'] = 'published'
     for kind in ('reaches', 'nodes'):
-        manifest['products'][kind]['publication_mode'] = 'ckan_upload'
+        manifest['products'][kind]['publication_mode'] = 'azure_url'
         manifest['products'][kind]['enabled'] = True
     manifest['ckan'] = {'dataset_id': dataset, 'reach_resource_id': results['reaches']['resource_id'], 'node_resource_id': results['nodes']['resource_id']}
     if 'documentation' in results:
