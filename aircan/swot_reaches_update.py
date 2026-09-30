@@ -33,10 +33,13 @@ from swot_nodes_update import (
 )
 
 REACH_FILTER_FIELDS = ("reach_q", "obs_frac_n", "dark_frac", "xovr_cal_q", "ice_clim_f", "xtrk_dist")
-REACH_FIELDS = "time_str,wse,slope,width,reach_q,obs_frac_n,dark_frac,xovr_cal_q,ice_clim_f,xtrk_dist"
+REACH_FIELDS = "reach_id,time_str,cycle_id,pass_id,wse,slope,width,area_total,dschg_gm,dschg_gm_q,reach_q,reach_q_b,river_name,crid,sword_version,collection_shortname,collection_version,granuleUR,obs_frac_n,dark_frac,xovr_cal_q,ice_clim_f,xtrk_dist"
 REACH_OUTPUT_COLUMNS = [
-    "time_utc", "wse", "slope", "width", "reach_q",
-    "wse_units", "slope_units", "width_units", "consensus_q",
+    "reach_id", "time_utc", "wse", "wse_units", "slope", "slope_units",
+    "width", "width_units", "area_total", "area_total_units", "dschg_gm",
+    "dschg_gm_units", "dschg_gm_q", "reach_q", "reach_q_b", "consensus_q",
+    "consensus_q_units", "cycle_id", "pass_id", "river_name", "crid",
+    "sword_version", "collection_shortname", "collection_version", "granuleUR",
     "obs_frac_n", "dark_frac", "xovr_cal_q", "ice_clim_f", "xtrk_dist",
 ]
 FILL_VALUE_THRESHOLD = -1.0e9
@@ -124,7 +127,7 @@ def filter_reach_observations(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def normalize_reaches(frame: pd.DataFrame) -> pd.DataFrame:
-    """Enforce the exact nine-column contract used by the proven updater."""
+    """Preserve the full archival schema shared with historical provisioning."""
     if frame is None or frame.empty:
         return pd.DataFrame(columns=REACH_OUTPUT_COLUMNS)
     output = frame.copy()
@@ -135,12 +138,13 @@ def normalize_reaches(frame: pd.DataFrame) -> pd.DataFrame:
     parsed = pd.to_datetime(output["time_utc"], format="mixed", errors="coerce", utc=True)
     output = output.loc[parsed.notna()].copy()
     output["time_utc"] = parsed.loc[output.index].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    for column in ("wse", "slope", "width", "reach_q", "consensus_q", *REACH_FILTER_FIELDS[1:]):
+    for column in ("wse", "slope", "width", "reach_q", "consensus_q", "area_total", "dschg_gm", "dschg_gm_q", "reach_q_b", *REACH_FILTER_FIELDS[1:]):
         if column in output:
             output[column] = pd.to_numeric(output[column], errors="coerce")
             output.loc[output[column] <= FILL_VALUE_THRESHOLD, column] = pd.NA
     for column, value in {
         "wse_units": "m", "slope_units": "m/m", "width_units": "m",
+        "consensus_q_units": "m^3/s",
     }.items():
         if column not in output:
             output[column] = value
@@ -164,6 +168,12 @@ def merge_reaches(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFram
     existing = normalize_reaches(existing)
     incoming = normalize_reaches(incoming)
     if not existing.empty and not incoming.empty:
+        # Sparse source revisions must not discard archival identifiers.
+        metadata = ['reach_id', 'cycle_id', 'pass_id', 'river_name', 'crid',
+                    'sword_version', 'collection_shortname', 'collection_version', 'granuleUR']
+        prior = existing.set_index('time_utc')
+        for column in metadata:
+            incoming[column] = incoming[column].where(incoming[column].notna(), incoming['time_utc'].map(prior[column]))
         prior_q = existing[["time_utc", "consensus_q"]].drop_duplicates("time_utc", keep="last")
         incoming = incoming.drop(columns=["consensus_q"], errors="ignore").merge(
             prior_q, on="time_utc", how="left"
@@ -285,6 +295,7 @@ def update_one_reach(
         if discharge is not None:
             discharge = discharge.loc[pd.to_datetime(discharge.time_utc, utc=True) <= end]
         final = merge_discharge(final, discharge)
+        final['reach_id'] = final['reach_id'].fillna(reach_id)
         encoded = csv_bytes(final)
         empty_bytes = csv_bytes(pd.DataFrame(columns=REACH_OUTPUT_COLUMNS))
         changed = encoded != (previous_bytes or empty_bytes)
