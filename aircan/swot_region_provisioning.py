@@ -778,7 +778,7 @@ def improve_dataset_metadata(session: requests.Session, dataset: str, root: Path
         },
     })
 
-def ensure_destination_dataset(session: requests.Session, submission: dict[str, Any]) -> dict[str, Any]:
+def ensure_destination_dataset(session: requests.Session, submission: dict[str, Any], persist_identity=None) -> dict[str, Any]:
     """Return the requested regional dataset, creating it once when absent."""
     requested_name = str(submission.get('destination_dataset_name') or '').strip()
     requested_title = str(submission.get('destination_dataset_title') or '').strip()
@@ -811,9 +811,18 @@ def ensure_destination_dataset(session: requests.Session, submission: dict[str, 
         })
     # A deleted slug remains reserved in CKAN. A fresh UUID also makes retries
     # independent of display-name changes. The caller persists it immediately.
-    if existing or submission.get('destination_dataset_id'):
+    if existing or (submission.get('destination_dataset_id') and not submission.get('destination_creation_pending')):
         requested_name = requested_name[:60] + '-' + uuid.uuid4().hex
+    proposed_id = (submission.get('destination_dataset_id')
+                   if submission.get('destination_creation_pending') and not existing
+                   else str(uuid.uuid4()))
+    submission.update(destination_dataset_id=proposed_id,
+                      destination_dataset_name=requested_name,
+                      destination_creation_pending=True)
+    if persist_identity:
+        persist_identity(submission)
     data = {
+        'id': proposed_id,
         'name': requested_name,
         'identifier': requested_name,
         'title': requested_title,
@@ -833,7 +842,21 @@ def ensure_destination_dataset(session: requests.Session, submission: dict[str, 
         'access_level': 'public',
         'private': 'false',
     }
-    return api(session, 'package_create', data)
+    try:
+        created = api(session, 'package_create', data)
+    except requests.RequestException:
+        # A proxy/plugin can fail after CKAN commits creation. Recover only our
+        # preassigned UUID, never an unrelated dataset sharing the display name.
+        try:
+            created = api(session, 'package_show', {'id': proposed_id})
+        except requests.RequestException:
+            raise
+        if created.get('id') != proposed_id or created.get('state') != 'active':
+            raise RuntimeError(f'Creation did not produce an active destination {proposed_id}')
+    if created.get('id') != proposed_id:
+        raise RuntimeError('CKAN did not preserve the preassigned destination UUID')
+    submission.pop('destination_creation_pending', None)
+    return created
 
 def add_discharge(payload: dict[str, Any], csv_dir: Path, chart_dir: Path, region_id: str) -> None:
     chart_dir.mkdir(parents=True, exist_ok=True)
@@ -1170,7 +1193,10 @@ def provision_submission(*, descriptor: dict[str, str], workers: int=8, timeout:
                 raise RuntimeError('CKAN_API_KEY is required to create and publish the destination dataset')
             ckan_session = requests.Session()
             ckan_session.headers.update({'Authorization': key, 'X-CKAN-API-Key': key})
-            destination = ensure_destination_dataset(ckan_session, submission)
+            destination = ensure_destination_dataset(
+                ckan_session, submission,
+                persist_identity=lambda identity: _upload_json(container, metadata_blob, identity))
+            submission.pop('destination_creation_pending', None)
             submission['destination_dataset_id'] = destination['id']
             submission['destination_dataset_name'] = destination['name']
             # Save before publication: a retry must reuse this UUID even if a
