@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import zipfile
+import uuid
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
@@ -147,12 +148,31 @@ COLLECTION = 'SWOT_L2_HR_RiverSP_D'
 DEFAULT_START = '2023-03-30T00:00:00Z'
 
 REACH_FIELDS = 'reach_id,time_str,cycle_id,pass_id,wse,slope,width,area_total,dschg_gm,dschg_gm_q,reach_q,reach_q_b,river_name,crid,sword_version,collection_shortname,collection_version,granuleUR'
+REACH_FILTER_FIELDS = ('reach_q', 'obs_frac_n', 'dark_frac', 'xovr_cal_q', 'ice_clim_f', 'xtrk_dist')
+REACH_FIELDS += ',obs_frac_n,dark_frac,xovr_cal_q,ice_clim_f,xtrk_dist'
 
 NODE_FIELDS = 'node_id,reach_id,time_str,lat,lon,river_name,wse,wse_u,wse_r_u,width,width_u,node_q,node_q_b,ice_clim_f,xovr_cal_q,cycle_id,pass_id,crid,sword_version,collection_shortname,collection_version,granuleUR'
 
 REACH_OUTPUT_COLUMNS = ['reach_id', 'time_utc', 'wse', 'wse_units', 'slope', 'slope_units', 'width', 'width_units', 'area_total', 'area_total_units', 'dschg_gm', 'dschg_gm_units', 'dschg_gm_q', 'reach_q', 'reach_q_b', 'consensus_q', 'consensus_q_units', 'cycle_id', 'pass_id', 'river_name', 'crid', 'sword_version', 'collection_shortname', 'collection_version', 'granuleUR']
 
 _thread_local = threading.local()
+REACH_OUTPUT_COLUMNS += ['obs_frac_n', 'dark_frac', 'xovr_cal_q', 'ice_clim_f', 'xtrk_dist']
+
+def filter_reach_observations(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame.copy()
+    missing = [field for field in REACH_FILTER_FIELDS if field not in frame]
+    if missing:
+        raise ValueError(f'Hydrocron reach response is missing required quality fields: {missing}')
+    q = {field: pd.to_numeric(frame[field], errors='coerce') for field in REACH_FILTER_FIELDS}
+    nonfill = pd.Series(True, index=frame.index)
+    for values in q.values():
+        nonfill &= values.notna() & values.abs().lt(1.0e9)
+    valid = (nonfill & q['reach_q'].between(0, 2)
+             & q['obs_frac_n'].ge(0.5) & q['dark_frac'].le(0.3)
+             & q['xovr_cal_q'].eq(0) & q['ice_clim_f'].eq(0)
+             & q['xtrk_dist'].abs().gt(10_000) & q['xtrk_dist'].abs().lt(60_000))
+    return frame.loc[valid].copy()
 
 @dataclass
 class FeatureResult:
@@ -222,7 +242,7 @@ def normalize_reaches(frame: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=REACH_OUTPUT_COLUMNS)
     if 'time_str' not in frame:
         raise ValueError('Hydrocron reach response has no time_str field')
-    output = frame.copy()
+    output = filter_reach_observations(frame)
     parsed = pd.to_datetime(output['time_str'], format='mixed', errors='coerce', utc=True)
     output = output.loc[parsed.notna()].copy()
     output['time_utc'] = parsed.loc[output.index].dt.strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -561,6 +581,9 @@ def camera(value: dict[str, float]) -> dict[str, float]:
     return {'west': value['west'] - dx, 'south': value['south'] - dy, 'east': value['east'] + dx, 'north': value['north'] + dy}
 
 def chart_html(kind: str) -> str:
+    return _chart_html(kind).replace("can-download='false'", "can-download='true'").replace("src='{{chart_url}}'", "src='{{chart_url}}' downloads='{{url}}'").replace("src='{{url}}'", "src='{{url}}' downloads='{{url}}'")
+
+def _chart_html(kind: str) -> str:
     if kind == 'nodes':
         return "<div><strong>SWOT River Node</strong><p>Teal nodes contain Version D observations passing the project quality filter; gray nodes currently have none.</p></div>{{#has_data}}<chart id='{{node_id}}-variables' title='Node Variables - {{node_id}}' src='{{url}}' x-column='time_utc' y-columns='wse,width' chart-type='lineAndPoint' stroke='rgba(0,0,0,0)' can-download='false'></chart>{{/has_data}}<table><tr><th>Node ID</th><td>{{node_id}}</td></tr><tr><th>Reach ID</th><td>{{reach_id}}</td></tr><tr><th>Accepted observations</th><td>{{observation_count}}</td></tr>{{#has_data}}<tr><th>Full CSV</th><td><a href='{{url}}' target='_blank'>Open CSV</a></td></tr>{{/has_data}}</table>"
     return "<div><strong>SWOT River Reach</strong><p>Blue reaches contain valid DAWG consensus discharge; brown reaches retain SWOT observations without discharge.</p></div>{{#has_data}}<chart id='{{reach_id}}-variables' title='Reach Variables - {{reach_id}}' src='{{chart_url}}' x-column='time_utc' y-columns='wse,slope_cm_per_km,width,consensus_q' column-titles='slope_cm_per_km:Slope (cm/km)' chart-type='lineAndPoint' stroke='rgba(0,0,0,0)' can-download='false'></chart>{{/has_data}}<table><tr><th>Reach ID</th><td>{{reach_id}}</td></tr><tr><th>Observations</th><td>{{observation_count}}</td></tr><tr><th>Discharge observations</th><td>{{discharge_count}}</td></tr>{{#has_data}}<tr><th>Full CSV</th><td><a href='{{url}}' target='_blank'>Open CSV</a></td></tr>{{/has_data}}</table>"
@@ -769,11 +792,14 @@ def ensure_destination_dataset(session: requests.Session, submission: dict[str, 
         'and is not validated for operational or safety-critical decisions.'
     )
     try:
-        existing = api(session, 'package_show', {'id': requested_name})
+        existing = api(session, 'package_show', {'id': submission.get('destination_dataset_id') or requested_name})
     except requests.HTTPError as exc:
         if exc.response is None or exc.response.status_code != 404:
             raise
-    else:
+        existing = None
+    if existing and existing.get('state', 'active') not in {'active', 'deleted'}:
+        raise RuntimeError(f'Destination {existing.get("id")} has unexpected state {existing.get("state")}')
+    if existing and existing.get('state', 'active') == 'active' and submission.get('destination_dataset_id'):
         return api(session, 'package_patch', {
             'id': existing['id'],
             'title': requested_title,
@@ -781,7 +807,12 @@ def ensure_destination_dataset(session: requests.Session, submission: dict[str, 
             'notes': description,
             'notes_translated': json.dumps({'en': description, 'es': '', 'fr': ''}),
             'version': 'Experimental',
+            'private': 'false',
         })
+    # A deleted slug remains reserved in CKAN. A fresh UUID also makes retries
+    # independent of display-name changes. The caller persists it immediately.
+    if existing or submission.get('destination_dataset_id'):
+        requested_name = requested_name[:60] + '-' + uuid.uuid4().hex
     data = {
         'name': requested_name,
         'identifier': requested_name,
@@ -800,6 +831,7 @@ def ensure_destination_dataset(session: requests.Session, submission: dict[str, 
         'language': 'http://publications.europa.eu/resource/authority/language/ENG',
         'topic': 'http://inspire.ec.europa.eu/metadata-codelist/TopicCategory/inlandWaters',
         'access_level': 'public',
+        'private': 'false',
     }
     return api(session, 'package_create', data)
 
@@ -883,6 +915,8 @@ def publish_region(root: Path, display_name: str | None=None, region_id: str | N
         raise ValueError(f'Refusing unexpected Azure account {container.account_name!r}')
     manifest_blob = f'regions/{region_id}/manifest.json'
     previous_ckan = _load_existing_manifest(container, manifest_blob).get('ckan') or {}
+    if previous_ckan.get('dataset_id') != dataset:
+        previous_ckan = {}
     sources = {kind: root / kind / f'{kind}.geojson' for kind in ('reaches', 'nodes')}
     payloads = {kind: json.loads(path.read_text(encoding='utf-8')) for (kind, path) in sources.items()}
     chart_dir = out / 'reach-chart-timeseries'
@@ -920,6 +954,13 @@ def publish_region(root: Path, display_name: str | None=None, region_id: str | N
             'resource_page': f"{CKAN}/dataset/{dataset}/resource/{document['id']}",
         }
     improve_dataset_metadata(session, dataset, root, prepared['reaches'][1])
+    verified = api(session, 'package_show', {'id': dataset})
+    if verified.get('state') != 'active':
+        raise RuntimeError(f'Publication destination {dataset} is not active: {verified.get("state")}')
+    expected_resources = {item['resource_id'] for item in results.values()}
+    actual_resources = {item['id'] for item in verified.get('resources', [])}
+    if not expected_resources.issubset(actual_resources):
+        raise RuntimeError(f'Publication destination {dataset} is missing published resources')
     manifest['status'] = 'published'
     for kind in ('reaches', 'nodes'):
         manifest['products'][kind]['publication_mode'] = 'azure_url'
@@ -1130,6 +1171,11 @@ def provision_submission(*, descriptor: dict[str, str], workers: int=8, timeout:
             ckan_session = requests.Session()
             ckan_session.headers.update({'Authorization': key, 'X-CKAN-API-Key': key})
             destination = ensure_destination_dataset(ckan_session, submission)
+            submission['destination_dataset_id'] = destination['id']
+            submission['destination_dataset_name'] = destination['name']
+            # Save before publication: a retry must reuse this UUID even if a
+            # resource/view upload or the final metadata update fails.
+            _upload_json(container, metadata_blob, submission)
             publication = publish_region(root, submission['display_name'], submission['region_id'], destination['id'], ckan_api_key=key, documentation_source=submission.get('documentation_source'))
             publication['dataset_id'] = destination['id']
             publication['dataset_name'] = destination['name']
