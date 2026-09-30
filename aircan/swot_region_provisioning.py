@@ -620,7 +620,15 @@ def api(session: requests.Session, action: str, data: dict[str, Any], files=None
         response.close()
         time.sleep(delay + random.uniform(0, 1))
     assert response is not None
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        detail = response.text[:2500]
+        for header in ('Authorization', 'X-CKAN-API-Key'):
+            secret = session.headers.get(header)
+            if secret:
+                detail = detail.replace(secret, '[REDACTED]')
+        raise requests.HTTPError(f'CKAN {action} HTTP {response.status_code}: {detail}', response=response) from exc
     payload = response.json()
     if not payload.get('success'):
         raise RuntimeError(json.dumps(payload, ensure_ascii=False))
@@ -799,7 +807,7 @@ def ensure_destination_dataset(session: requests.Session, submission: dict[str, 
         existing = None
     if existing and existing.get('state', 'active') not in {'active', 'deleted'}:
         raise RuntimeError(f'Destination {existing.get("id")} has unexpected state {existing.get("state")}')
-    if existing and existing.get('state', 'active') == 'active' and submission.get('destination_dataset_id'):
+    if existing and existing.get('state', 'active') == 'active' and (submission.get('destination_dataset_id') or submission.get('destination_creation_pending')):
         return api(session, 'package_patch', {
             'id': existing['id'],
             'title': requested_title,
@@ -809,20 +817,16 @@ def ensure_destination_dataset(session: requests.Session, submission: dict[str, 
             'version': 'Experimental',
             'private': 'false',
         })
-    # A deleted slug remains reserved in CKAN. A fresh UUID also makes retries
-    # independent of display-name changes. The caller persists it immediately.
-    if existing or (submission.get('destination_dataset_id') and not submission.get('destination_creation_pending')):
+    # IHP-WINS rejects client-assigned IDs. Persist a unique creation slug;
+    # subsequent updates use the UUID returned by CKAN.
+    if existing or not submission.get('destination_creation_pending'):
         requested_name = requested_name[:60] + '-' + uuid.uuid4().hex
-    proposed_id = (submission.get('destination_dataset_id')
-                   if submission.get('destination_creation_pending') and not existing
-                   else str(uuid.uuid4()))
-    submission.update(destination_dataset_id=proposed_id,
-                      destination_dataset_name=requested_name,
+    submission.pop('destination_dataset_id', None)
+    submission.update(destination_dataset_name=requested_name,
                       destination_creation_pending=True)
     if persist_identity:
         persist_identity(submission)
     data = {
-        'id': proposed_id,
         'name': requested_name,
         'identifier': requested_name,
         'title': requested_title,
@@ -844,17 +848,16 @@ def ensure_destination_dataset(session: requests.Session, submission: dict[str, 
     }
     try:
         created = api(session, 'package_create', data)
-    except requests.RequestException:
+    except requests.RequestException as creation_error:
         # A proxy/plugin can fail after CKAN commits creation. Recover only our
-        # preassigned UUID, never an unrelated dataset sharing the display name.
+        # persisted unique creation slug, not the human-readable title.
         try:
-            created = api(session, 'package_show', {'id': proposed_id})
-        except requests.RequestException:
-            raise
-        if created.get('id') != proposed_id or created.get('state') != 'active':
-            raise RuntimeError(f'Creation did not produce an active destination {proposed_id}')
-    if created.get('id') != proposed_id:
-        raise RuntimeError('CKAN did not preserve the preassigned destination UUID')
+            created = api(session, 'package_show', {'id': requested_name})
+        except Exception:
+            raise creation_error
+        if created.get('name') != requested_name or created.get('state') != 'active':
+            raise creation_error
+    submission['destination_dataset_id'] = created['id']
     submission.pop('destination_creation_pending', None)
     return created
 
@@ -1186,7 +1189,6 @@ def provision_submission(*, descriptor: dict[str, str], workers: int=8, timeout:
             continent_counts = None
             continent = 'GLOBAL' if submission['continent'] == 'AUTO' else submission['continent']
             output_root = temp_path / 'output'
-            historical = run_historical_aoi_pipeline(aoi=str(aoi_path), region_id=submission['region_id'], display_name=submission['display_name'], continent=continent, output_root=str(output_root), start=submission['historical_start'], workers=workers, timeout=timeout, retries=retries, upload=True, overwrite_azure=True, register_manifest=False, connection_string_env=connection_string_env)
             root = output_root / submission['region_id'] / 'historical'
             key = (ckan_api_key or runtime_secret('IHP_WINS_CKAN_API_KEY') or runtime_secret('CKAN_API_KEY')).strip()
             if not key:
@@ -1202,6 +1204,7 @@ def provision_submission(*, descriptor: dict[str, str], workers: int=8, timeout:
             # Save before publication: a retry must reuse this UUID even if a
             # resource/view upload or the final metadata update fails.
             _upload_json(container, metadata_blob, submission)
+            historical = run_historical_aoi_pipeline(aoi=str(aoi_path), region_id=submission['region_id'], display_name=submission['display_name'], continent=continent, output_root=str(output_root), start=submission['historical_start'], workers=workers, timeout=timeout, retries=retries, upload=True, overwrite_azure=True, register_manifest=False, connection_string_env=connection_string_env)
             publication = publish_region(root, submission['display_name'], submission['region_id'], destination['id'], ckan_api_key=key, documentation_source=submission.get('documentation_source'))
             publication['dataset_id'] = destination['id']
             publication['dataset_name'] = destination['name']
