@@ -282,6 +282,8 @@ def build_preview(
         },
         "documentation_source": dict(GUIDE_RESOURCE),
     }
+    if assigned_identity and assigned_identity.get('destination_dataset_id'):
+        submission['destination_dataset_id'] = assigned_identity['destination_dataset_id']
     return preview, geojson, submission
 
 
@@ -385,6 +387,7 @@ def load_intake_registry(
                 "region_id": submission.get("region_id"),
                 "destination_dataset_name": submission.get("destination_dataset_name"),
                 "status": "completed_archive",
+                "destination_dataset_id": submission.get("destination_dataset_id"),
             }
     # Pending sources must also be reserved so a repeated poll cannot create a
     # second suffix while the first submission is waiting or running.
@@ -394,7 +397,7 @@ def load_intake_registry(
         submission = json.loads(container.get_blob_client(blob.name).download_blob().readall())
         source = submission.get("source_intake") or {}
         source_id = str(source.get("resource_id") or "")
-        if source_id and source_id not in registry:
+        if source_id:
             registry[source_id] = {
                 "source_dataset_id": source.get("dataset_id"),
                 "source_resource_id": source_id,
@@ -404,8 +407,30 @@ def load_intake_registry(
                 "region_id": submission.get("region_id"),
                 "destination_dataset_name": submission.get("destination_dataset_name"),
                 "status": "pending",
+                "destination_dataset_id": submission.get("destination_dataset_id"),
             }
     return registry
+
+
+def checked_assignment(prior, *, api_key=None):
+    """Validate identity before unchanged-source shortcuts; 403 is not absence."""
+    if not prior or prior.get('status') == 'pending':
+        return prior
+    identifier = prior.get('destination_dataset_id') or prior.get('destination_dataset_name')
+    if not identifier:
+        return None
+    try:
+        destination = ckan_action('package_show', {'id': identifier}, api_key)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise
+    if destination.get('state') == 'deleted':
+        return None
+    if destination.get('state') != 'active':
+        raise RuntimeError(f'Destination {identifier} has unexpected state {destination.get("state")}')
+    return {**prior, 'destination_dataset_id': destination['id'],
+            'destination_dataset_name': destination['name']}
 
 
 def enqueue_live_dataset(
@@ -427,10 +452,12 @@ def enqueue_live_dataset(
     taken_region_ids = {
         name[len(prefix):] for name in taken_dataset_names if name.startswith(prefix)
     }
+    taken_region_ids.update(item['region_id'] for item in registry.values() if item.get('region_id'))
+    taken_dataset_names.update(item['destination_dataset_name'] for item in registry.values() if item.get('destination_dataset_name'))
     queued: list[dict[str, Any]] = []
     skipped: list[dict[str, str]] = []
     for resource in discover_resources(dataset_id, api_key=key):
-        prior = registry.get(resource.id)
+        prior = checked_assignment(registry.get(resource.id), api_key=key)
         if prior and resource.last_modified and prior.get("source_last_modified") == resource.last_modified:
             skipped.append({"resource_id": resource.id, "reason": "unchanged_last_modified"})
             continue
@@ -518,10 +545,12 @@ def main() -> int:
         name[len(prefix):] for name in taken_dataset_names if name.startswith(prefix)
     }
     registry = load_intake_registry() if args.enqueue else {}
+    taken_region_ids.update(item['region_id'] for item in registry.values() if item.get('region_id'))
+    taken_dataset_names.update(item['destination_dataset_name'] for item in registry.values() if item.get('destination_dataset_name'))
     for resource in resources:
         data = download_resource(resource)
         source_hash = hashlib.sha256(data).hexdigest()
-        prior = registry.get(resource.id)
+        prior = checked_assignment(registry.get(resource.id))
         if prior and prior.get("source_sha256") == source_hash:
             continue
         preview, geojson, submission = build_preview(
